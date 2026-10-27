@@ -36,6 +36,9 @@ class PaymentRepository(ABC):
     @abstractmethod
     def find_captured_by_occurrence_id(self, occurrence_id: str) -> Optional[Payment]: ...
 
+    @abstractmethod
+    def find_by_ids(self, ids: list[str]) -> list[Payment]: ...
+
 
 class IdempotencyStore(ABC):
     @abstractmethod
@@ -95,6 +98,10 @@ class InMemoryPaymentRepository(PaymentRepository):
         with self._lock:
             return next((p for p in self._store.values()
                          if p.occurrence_id == occurrence_id and p.is_captured), None)
+
+    def find_by_ids(self, ids):
+        with self._lock:
+            return [self._store[i] for i in ids if i in self._store]
 
 
 class InMemoryIdempotencyStore(IdempotencyStore):

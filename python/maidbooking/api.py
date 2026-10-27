@@ -1,8 +1,9 @@
+import os
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Callable, Optional
 
-from fastapi import FastAPI, Header, Query, Request
+from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -16,11 +17,10 @@ from .exceptions import (InvalidRequestError, InvalidStateError, NotFoundError, 
                          SlotUnavailableError)
 from .payment_processors import (CardPaymentProcessor, PaymentProcessorRegistry, UpiPaymentProcessor,
                                  WalletPaymentProcessor)
+from .config import build_infrastructure, local_clock
 from .pricing import HourlyPricingStrategy
-from .repositories import (InMemoryBookingRepository, InMemoryIdempotencyStore, InMemoryMaidRepository,
-                           InMemoryPaymentRepository)
 from .search import MaidSearchCriteria, MaidSearchService, standard_providers
-from .services import (AvailabilityService, BookingService, CancellationService, MaidLockManager, MaidService,
+from .services import (AvailabilityService, BookingService, CancellationService, MaidService,
                        OnboardMaidCommand, PayCommand, PaymentService)
 
 DEFAULT_SEARCH_DURATION_MINUTES = 60
@@ -82,10 +82,10 @@ def booking_json(b: Booking) -> dict:
                              "status": o.status} for o in b.occurrences]}
 
 
-def create_app(clock: Callable[[], datetime] = datetime.now) -> FastAPI:
-    maid_repo, booking_repo = InMemoryMaidRepository(), InMemoryBookingRepository()
-    payment_repo = InMemoryPaymentRepository()
-    locks = MaidLockManager()
+def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Optional[str] = None) -> FastAPI:
+    clock = clock or local_clock()
+    infra = build_infrastructure(database_url)
+    maid_repo, booking_repo, payment_repo, locks = infra.maids, infra.bookings, infra.payments, infra.locks
     processors = PaymentProcessorRegistry([CardPaymentProcessor(), UpiPaymentProcessor(), WalletPaymentProcessor()])
     availability = AvailabilityService(booking_repo)
     maid_service = MaidService(maid_repo)
@@ -94,7 +94,7 @@ def create_app(clock: Callable[[], datetime] = datetime.now) -> FastAPI:
         maid_service, booking_repo,
         BookingStrategyRegistry([InstantBookingStrategy(), ScheduledBookingStrategy(), RecurringBookingStrategy()]),
         availability, HourlyPricingStrategy(), locks, clock)
-    payment_service = PaymentService(booking_repo, payment_repo, InMemoryIdempotencyStore(), processors, locks)
+    payment_service = PaymentService(booking_repo, payment_repo, infra.idempotency, processors, locks)
     cancellation_service = CancellationService(booking_repo, payment_repo, processors,
                                                TimeBasedCancellationPolicy(), locks, clock)
 
@@ -113,6 +113,17 @@ def create_app(clock: Callable[[], datetime] = datetime.now) -> FastAPI:
     async def validation_error(_: Request, e: RequestValidationError):
         message = "; ".join(f"{'.'.join(map(str, err['loc'][1:]))} {err['msg']}" for err in e.errors())
         return JSONResponse(status_code=400, content={"code": "INVALID_REQUEST", "message": message})
+
+    @app.get("/health")
+    def health(response: Response):
+        if infra.engine is not None:
+            try:
+                with infra.engine.connect() as conn:
+                    conn.exec_driver_sql("SELECT 1")
+            except Exception:
+                response.status_code = 503
+                return {"status": "unavailable", "storage": infra.storage}
+        return {"status": "ok", "storage": infra.storage}
 
     @app.post("/api/maids", status_code=201)
     def add_maid(r: AddMaidRequest):
@@ -171,4 +182,4 @@ def _requested_slot(day: Optional[date], start: Optional[time], minutes: Optiona
     return TimeSlot.of(datetime.combine(day, start), minutes or DEFAULT_SEARCH_DURATION_MINUTES)
 
 
-app = create_app()
+app = create_app(database_url=os.getenv("DATABASE_URL"))

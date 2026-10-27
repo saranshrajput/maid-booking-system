@@ -21,7 +21,7 @@ def test_successful_payment_confirms_booking(ctx, maid):
     booking = ctx.book_scheduled(maid, START, 60)
     payments = ctx.payments.pay(booking.id, PayCommand(PaymentMethodType.CARD, CARD))
     assert len(payments) == 1
-    assert booking.status == BookingStatus.CONFIRMED
+    assert ctx.bookings.get(booking.id).status == BookingStatus.CONFIRMED
 
 
 def test_failed_payment_leaves_booking_awaiting_payment(ctx, maid):
@@ -40,13 +40,14 @@ def test_malformed_instrument_is_declined(ctx, maid):
 def test_recurring_booking_can_be_paid_per_occurrence(ctx, maid):
     booking = recurring(ctx, maid, 3)
     ctx.payments.pay(booking.id, PayCommand(PaymentMethodType.WALLET, "wallet-1", booking.occurrences[0].id))
-    assert booking.occurrences[0].status == OccurrenceStatus.CONFIRMED
-    assert booking.occurrences[1].status == OccurrenceStatus.PENDING_PAYMENT
-    assert booking.status == BookingStatus.AWAITING_PAYMENT
+    reloaded = ctx.bookings.get(booking.id)
+    assert reloaded.occurrences[0].status == OccurrenceStatus.CONFIRMED
+    assert reloaded.occurrences[1].status == OccurrenceStatus.PENDING_PAYMENT
+    assert reloaded.status == BookingStatus.AWAITING_PAYMENT
 
     rest = ctx.payments.pay(booking.id, PayCommand(PaymentMethodType.WALLET, "wallet-1"))
     assert len(rest) == 2
-    assert booking.status == BookingStatus.CONFIRMED
+    assert ctx.bookings.get(booking.id).status == BookingStatus.CONFIRMED
 
 
 def test_paying_an_already_paid_occurrence_is_an_invalid_transition(ctx, maid):

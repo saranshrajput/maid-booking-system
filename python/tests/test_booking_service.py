@@ -84,3 +84,29 @@ def test_concurrent_requests_for_same_slot_yield_exactly_one_booking(ctx, maid):
 
     assert results.count(True) == 1
     assert len(ctx.booking_repo.find_by_maid_id(maid.id)) == 1
+
+
+def test_two_app_instances_sharing_a_database_cannot_double_book():
+    import os
+    from tests.conftest import Ctx
+    url = os.getenv("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("TEST_DATABASE_URL not set")
+    instance_a, instance_b = Ctx(url), Ctx(url, reset=False)  # Separate in-process locks, one database.
+    maid = instance_a.maid()
+    threads = 16
+    barrier = Barrier(threads)
+
+    def attempt(i):
+        barrier.wait()
+        try:
+            (instance_a if i % 2 else instance_b).book_scheduled(maid, TOMORROW_10, 60)
+            return True
+        except SlotUnavailableError:
+            return False
+
+    with ThreadPoolExecutor(threads) as pool:
+        results = list(pool.map(attempt, range(threads)))
+
+    assert results.count(True) == 1
+    assert len(instance_a.booking_repo.find_by_maid_id(maid.id)) == 1

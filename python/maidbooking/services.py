@@ -1,5 +1,6 @@
 import threading
 import uuid
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +21,12 @@ T = TypeVar("T")
 MAX_DURATION_MINUTES = 12 * 60
 
 
-class MaidLockManager:
+class LockManager(ABC):
+    @abstractmethod
+    def with_lock(self, maid_id: str, action: Callable[[], T]) -> T: ...
+
+
+class MaidLockManager(LockManager):
     """Serialises every mutation of a maid's inventory (book, pay, cancel) behind one lock per maid."""
 
     def __init__(self):
@@ -74,7 +80,7 @@ class MaidService:
 
 class BookingService:
     def __init__(self, maids: MaidService, bookings: BookingRepository, strategies: BookingStrategyRegistry,
-                 availability: AvailabilityService, pricing: PricingStrategy, locks: MaidLockManager,
+                 availability: AvailabilityService, pricing: PricingStrategy, locks: LockManager,
                  clock: Callable[[], datetime]):
         self._maids = maids
         self._bookings = bookings
@@ -128,7 +134,7 @@ class PayCommand:
 
 class PaymentService:
     def __init__(self, bookings: BookingRepository, payments: PaymentRepository, idempotency: IdempotencyStore,
-                 processors: PaymentProcessorRegistry, locks: MaidLockManager):
+                 processors: PaymentProcessorRegistry, locks: LockManager):
         self._bookings = bookings
         self._payments = payments
         self._idempotency = idempotency
@@ -138,14 +144,13 @@ class PaymentService:
     def pay(self, booking_id: str, cmd: PayCommand, idempotency_key: Optional[str] = None) -> list[Payment]:
         if cmd.method is None:
             raise InvalidRequestError("Payment method is required")
-        booking = self._bookings.find_by_id(booking_id)
-        if booking is None:
-            raise NotFoundError(f"Booking not found: {booking_id}")
+        booking = self._load(booking_id)
         processor = self._processors.get(cmd.method)
         key = f"{booking_id}:{idempotency_key}" if idempotency_key and idempotency_key.strip() else None
 
         # Same lock as booking/cancel, so the key lookup and the charge are atomic per maid.
         def run() -> list[Payment]:
+            booking = self._load(booking_id)  # Re-read under the lock so state is current.
             if key and (previous := self._idempotency.find(key)) is not None:
                 return previous
             payments = [self._charge(booking, o, cmd, processor)
@@ -166,6 +171,12 @@ class PaymentService:
         occurrence.confirm()
         self._bookings.save(booking)
         return payment
+
+    def _load(self, booking_id: str) -> Booking:
+        booking = self._bookings.find_by_id(booking_id)
+        if booking is None:
+            raise NotFoundError(f"Booking not found: {booking_id}")
+        return booking
 
     @staticmethod
     def _payable(booking: Booking, occurrence_id: Optional[str]) -> list[BookingOccurrence]:
@@ -191,7 +202,7 @@ class CancellationResult:
 
 class CancellationService:
     def __init__(self, bookings: BookingRepository, payments: PaymentRepository,
-                 processors: PaymentProcessorRegistry, policy: CancellationPolicy, locks: MaidLockManager,
+                 processors: PaymentProcessorRegistry, policy: CancellationPolicy, locks: LockManager,
                  clock: Callable[[], datetime]):
         self._bookings = bookings
         self._payments = payments
@@ -202,11 +213,10 @@ class CancellationService:
 
     # occurrence_id None cancels every cancellable occurrence of the booking (the whole series).
     def cancel(self, booking_id: str, occurrence_id: Optional[str] = None) -> CancellationResult:
-        booking = self._bookings.find_by_id(booking_id)
-        if booking is None:
-            raise NotFoundError(f"Booking not found: {booking_id}")
+        booking = self._load(booking_id)
 
         def run() -> CancellationResult:
+            booking = self._load(booking_id)  # Re-read under the lock so state is current.
             now = self._clock()
             targets = self._targets(booking, occurrence_id, now)
             total = Decimal("0")
@@ -217,6 +227,12 @@ class CancellationService:
             return CancellationResult(booking, [o.id for o in targets], total)
 
         return self._locks.with_lock(booking.maid_id, run)
+
+    def _load(self, booking_id: str) -> Booking:
+        booking = self._bookings.find_by_id(booking_id)
+        if booking is None:
+            raise NotFoundError(f"Booking not found: {booking_id}")
+        return booking
 
     def _targets(self, booking, occurrence_id, now) -> list[BookingOccurrence]:
         if occurrence_id is None:

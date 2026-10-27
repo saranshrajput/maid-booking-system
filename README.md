@@ -1,14 +1,36 @@
 # Maid Booking System (Python)
 
-Python 3.10+ / FastAPI backend for the Rupeek SDE-3 machine-coding question (Maid Booking System). In-memory persistence.
+Python 3.10+ / FastAPI backend for the Rupeek SDE-3 machine-coding question (Maid Booking System). In-memory by default; Postgres when `DATABASE_URL` is set.
 
 ## Build and run
 
 ```bash
 cd python && pip install -r requirements.txt
-python -m pytest                          # 37 unit + API tests
+python -m pytest                          # 37 tests on the in-memory backend
 uvicorn maidbooking.api:app --reload      # http://localhost:8000, docs at /docs
 ```
+
+## Persistence and configuration
+
+| Env var | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres connection string. Unset = in-memory. `postgres://` and `postgresql://` are both accepted. Tables are created on startup. |
+| `APP_TIMEZONE` | Business timezone for "now" and availability windows (default `Asia/Kolkata`; servers on Render run UTC). |
+| `TEST_DATABASE_URL` | Enables the Postgres runs of the test suite (the service tests run on both backends: 69 tests). |
+
+Run the same suite against Postgres: `TEST_DATABASE_URL=postgresql://user:pass@localhost/db python -m pytest`.
+
+Double-booking protection with Postgres: each book, pay or cancel for a maid takes an in-process lock and then a Postgres advisory lock keyed on the maid id, so it holds across several app instances. A test with two app instances sharing one database fails if the advisory lock is removed.
+
+## Deploy on Render
+
+`render.yaml` at the repo root is a Blueprint for a web service plus a managed Postgres database.
+
+1. Push this repo to GitHub.
+2. In the Render dashboard choose **New > Blueprint**, pick the repo, and apply. Render creates `maid-booking-db` and `maid-booking-api` and wires `DATABASE_URL` into the service.
+3. When the deploy is live, open `https://<service>.onrender.com/docs` and call `/health` (it reports `"storage": "postgres"`).
+
+Notes: run a single worker (the start command already does); the schema is created by the app on startup, with no migration tool yet; check the plan names and free-tier limits in the Render dashboard before relying on them.
 
 ## API
 

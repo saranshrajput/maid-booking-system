@@ -30,7 +30,7 @@ def test_more_than_24_hours_before_start_refunds_in_full(ctx, maid):
     booking = paid_scheduled(ctx, maid, datetime(2030, 1, 9, 12, 0))
     result = ctx.cancellations.cancel(booking.id)
     assert result.total_refund == Decimal("200.00")
-    assert booking.status == BookingStatus.CANCELLED
+    assert ctx.bookings.get(booking.id).status == BookingStatus.CANCELLED
     payment = ctx.payment_repo.find_captured_by_occurrence_id(booking.occurrences[0].id)
     assert payment.status == PaymentStatus.REFUNDED
 
@@ -68,9 +68,10 @@ def test_recurring_single_occurrence_cancel_leaves_the_rest_active(ctx, maid):
     booking = paid_series(ctx, maid)
     result = ctx.cancellations.cancel(booking.id, booking.occurrences[1].id)
     assert len(result.cancelled_occurrence_ids) == 1
-    assert booking.occurrences[1].status == OccurrenceStatus.CANCELLED
-    assert booking.occurrences[0].status == OccurrenceStatus.CONFIRMED
-    assert booking.status == BookingStatus.CONFIRMED
+    reloaded = ctx.bookings.get(booking.id)
+    assert reloaded.occurrences[1].status == OccurrenceStatus.CANCELLED
+    assert reloaded.occurrences[0].status == OccurrenceStatus.CONFIRMED
+    assert reloaded.status == BookingStatus.CONFIRMED
 
 
 def test_recurring_whole_series_cancel_refunds_every_paid_occurrence(ctx, maid):
@@ -78,5 +79,5 @@ def test_recurring_whole_series_cancel_refunds_every_paid_occurrence(ctx, maid):
     result = ctx.cancellations.cancel(booking.id)
     assert len(result.cancelled_occurrence_ids) == 3
     assert result.total_refund == Decimal("600.00")
-    assert booking.status == BookingStatus.CANCELLED
+    assert ctx.bookings.get(booking.id).status == BookingStatus.CANCELLED
     assert ctx.availability.is_available(maid, booking.occurrences[0].slot)

@@ -39,3 +39,20 @@ def test_invalid_requests_return_400_and_404():
     assert client.post("/api/maids", json={}).status_code == 400
     assert client.get("/api/bookings/nope").status_code == 404
     assert client.get("/api/maids/search", params={"date": "2030-01-01"}).status_code == 400
+
+
+def test_postgres_backed_app_survives_restart():
+    import os
+    import pytest
+    url = os.getenv("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("TEST_DATABASE_URL not set")
+    from tests.conftest import reset_database
+    reset_database(url)
+
+    first = TestClient(create_app(database_url=url))
+    maid_id = first.post("/api/maids", json=MAID).json()["id"]
+    assert first.get("/health").json() == {"status": "ok", "storage": "postgres"}
+
+    restarted = TestClient(create_app(database_url=url))  # Fresh app, same database.
+    assert restarted.get(f"/api/maids/{maid_id}").status_code == 200
