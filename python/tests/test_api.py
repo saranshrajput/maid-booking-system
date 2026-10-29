@@ -80,3 +80,32 @@ def test_list_bookings_by_customer_and_ui_is_served():
     assert page.status_code == 200 and "Maid Booking" in page.text
     assert client.get("/app.js").status_code == 200
     assert client.get("/health").json()["status"] == "ok"  # API routes still win over the static mount
+
+
+def test_meta_and_slot_availability():
+    now = datetime(2030, 1, 7, 10, 0)
+    client = TestClient(create_app(clock=lambda: now))
+    assert client.get("/api/meta").json()["now"] == "2030-01-07T10:00:00"
+
+    maid_id = client.post("/api/maids", json=MAID).json()["id"]  # works 08:00-20:00 every day
+    params = {"date": "2030-01-08", "durationMinutes": 60, "locality": "Koramangala", "serviceType": "CLEANING"}
+
+    def counts():
+        return {s["time"]: s["available"] for s in client.get("/api/availability/slots", params=params).json()}
+
+    first = counts()
+    assert first["07:45"] == 0 and first["08:00"] == 1 and first["19:00"] == 1 and first["19:15"] == 0
+    assert first["06:00"] == 0 and first["22:00"] == 0
+
+    client.post("/api/bookings", json={"customerId": "c", "maidId": maid_id, "serviceType": "CLEANING",
+                                       "bookingType": "SCHEDULED", "durationMinutes": 60,
+                                       "startDateTime": "2030-01-08T10:00"})
+    booked = counts()
+    assert booked["09:15"] == 0 and booked["09:45"] == 0 and booked["10:45"] == 0  # overlap with 10:00-11:00
+    assert booked["09:00"] == 1 and booked["11:00"] == 1                           # back-to-back is fine
+
+    assert counts() == booked
+    today = {s["time"]: s["available"] for s in client.get(
+        "/api/availability/slots", params={**params, "date": "2030-01-07"}).json()}
+    assert today["10:00"] == 0 and today["10:15"] == 1  # a start that is not after now is not offered
+    assert client.get("/api/availability/slots", params={"durationMinutes": 60}).status_code == 400

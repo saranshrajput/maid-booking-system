@@ -3,7 +3,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable, Optional, TypeVar
 
@@ -48,8 +48,25 @@ class AvailabilityService:
         return maid.works_during(slot) and not self._is_booked(maid.id, slot)
 
     def _is_booked(self, maid_id: str, slot: TimeSlot) -> bool:
-        return any(o.is_active and o.slot.overlaps(slot)
-                   for b in self._bookings.find_by_maid_id(maid_id) for o in b.occurrences)
+        return any(s.overlaps(slot) for s in self._busy_slots(maid_id))
+
+    def _busy_slots(self, maid_id: str) -> list[TimeSlot]:
+        return [o.slot for b in self._bookings.find_by_maid_id(maid_id) for o in b.occurrences if o.is_active]
+
+    def start_time_counts(self, maids: list[Maid], day: date, duration_minutes: int, not_before: datetime,
+                          step_minutes: int = 15, earliest: time = time(6, 0), latest: time = time(22, 0)
+                          ) -> list[tuple[time, int]]:
+        """For each candidate start time on `day`, how many of `maids` are free for `duration_minutes`.
+        Starts that are not after `not_before` count as 0. Each maid's bookings are read once."""
+        busy = {m.id: self._busy_slots(m.id) for m in maids}
+        counts, start, last = [], datetime.combine(day, earliest), datetime.combine(day, latest)
+        while start <= last:
+            slot = TimeSlot.of(start, duration_minutes)
+            free = 0 if start <= not_before else sum(
+                1 for m in maids if m.works_during(slot) and not any(b.overlaps(slot) for b in busy[m.id]))
+            counts.append((start.time(), free))
+            start += timedelta(minutes=step_minutes)
+        return counts
 
 
 @dataclass(frozen=True)

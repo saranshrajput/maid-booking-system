@@ -12,16 +12,18 @@ uvicorn maidbooking.api:app --reload      # http://localhost:8000, docs at /docs
 
 ## Web UI
 
-The same FastAPI app serves a no-build web UI at `/` (files in `python/maidbooking/static/`), so a single deploy gives you both. Screens:
+The same FastAPI app serves a mobile-first web UI at `/` (files in `python/maidbooking/static/`, no build step), so a single deploy gives you both. It is a bottom-tab app with these screens:
 
-- **Find a maid**: filters for area, service, rating, max rate, gender, skills, and an optional date and start time that limits results to maids free then. Each maid card opens the booking dialog.
-- **Booking dialog**: instant, scheduled or recurring (pick weekdays and number of visits) with a live price estimate, then a payment step (card, UPI, wallet) that supports paying one visit or all unpaid visits.
-- **My bookings**: lists bookings for the customer id typed in the header ("Booking as", no login), with Pay and Cancel per visit and Cancel whole series. Refund amounts show after cancelling.
-- **Add a maid**: onboarding form with services, rates and weekly hours, plus a button that loads three sample maids.
+- **Home**: pick your area, then a service tile (cleaning, cooking, dishwashing, laundry, babysitting). Tiles show the lowest hourly rate and how many maids serve the area. A banner books a maid instantly.
+- **Choose service details**: Now, One day, Multiple days (a date range up to 14 days) or Weekly (pick weekdays and number of visits); a calendar, duration cards with prices, and start times in 15-minute steps. Times nobody can take are greyed out (`GET /api/availability/slots`).
+- **Choose your maid**: maids free for that exact slot, best rated first, with the total price. Booking holds the slot and opens the payment sheet (card, UPI or wallet; one visit or all unpaid visits).
+- **Your bookings**: All, Single, Multiple and Recurring filters, status pills (upcoming, in progress, completed, awaiting payment, cancelled), and expandable visit lists.
+- **Booking details**: status banner with time left while a visit is running, maid, date, payment status, a dot per visit, Pay and Cancel (one visit or the whole series, refund shown).
+- **Account**: customer id (there is no login), service area, and partner onboarding (add a maid, or load three sample maids).
 
-`GET /api/bookings?customerId=` backs the My bookings screen.
+"Upcoming", "in progress" and "completed" are derived in the browser from the server clock (`GET /api/meta`); the API itself only stores pending, confirmed and cancelled.
 
-Browser test (needs Node and the `playwright` package): `PYTHON=python ./python/e2e/run.sh` starts a fresh in-memory server and runs 34 checks across every screen, including a payment decline, a double-booking conflict, series payment and cancellation, and phone width. Set `DATABASE_URL` to run the same flow against Postgres (the database must be empty).
+Browser test (needs Node and the `playwright` package): `PYTHON=python ./python/e2e/run.sh` starts a fresh in-memory server and runs 43 checks across every screen, including slot greying, a payment decline, series payment and cancellation, and phone width. Set `DATABASE_URL` to run the same flow against Postgres (the database must be empty).
 
 ## Persistence and configuration
 
@@ -29,7 +31,7 @@ Browser test (needs Node and the `playwright` package): `PYTHON=python ./python/
 |---|---|
 | `DATABASE_URL` | Postgres connection string. Unset = in-memory. `postgres://` and `postgresql://` are both accepted. Tables are created on startup. |
 | `APP_TIMEZONE` | Business timezone for "now" and availability windows (default `Asia/Kolkata`; servers on Render run UTC). |
-| `TEST_DATABASE_URL` | Enables the Postgres runs of the test suite (the service tests run on both backends: 70 tests). |
+| `TEST_DATABASE_URL` | Enables the Postgres runs of the test suite (the service tests run on both backends: 71 tests). |
 
 Run the same suite against Postgres: `TEST_DATABASE_URL=postgresql://user:pass@localhost/db python -m pytest`.
 
@@ -55,6 +57,8 @@ Notes: run a single worker (the start command already does); the schema is creat
 | Book | `POST /api/bookings` |
 | Get booking | `GET /api/bookings/{id}` |
 | List a customer's bookings | `GET /api/bookings?customerId=` |
+| Free-maid count per start time | `GET /api/availability/slots?date=&durationMinutes=&serviceType=&locality=` |
+| Server clock | `GET /api/meta` |
 | Pay | `POST /api/bookings/{id}/payments` (optional `Idempotency-Key` header) |
 | Cancel | `POST /api/bookings/{id}/cancel[?occurrenceId=]` (no id = whole series) |
 

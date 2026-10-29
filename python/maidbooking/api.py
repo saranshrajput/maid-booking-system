@@ -134,6 +134,19 @@ def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Opt
         return maid_json(maid_service.onboard(OnboardMaidCommand(
             r.name, r.locality, r.gender, r.rating, r.hourlyRates, frozenset(r.skills), windows)))
 
+    @app.get("/api/meta")
+    def meta():
+        return {"now": clock().isoformat(timespec="seconds"), "timezone": os.getenv("APP_TIMEZONE", "Asia/Kolkata")}
+
+    @app.get("/api/availability/slots")
+    def availability_slots(day: date = Query(alias="date"), durationMinutes: int = Query(60, gt=0, le=720),
+                           locality: Optional[str] = None, serviceType: Optional[ServiceType] = None,
+                           gender: Optional[Gender] = None):
+        """Free-maid count for each start time on one day, so a UI can grey out times nobody can take."""
+        maids = search_service.search(MaidSearchCriteria(locality, serviceType, None, None, None, gender, None))
+        counts = availability.start_time_counts(maids, day, durationMinutes, not_before=clock())
+        return [{"time": t.strftime("%H:%M"), "available": n} for t, n in counts]
+
     @app.get("/api/maids/search")
     def search(locality: Optional[str] = None, serviceType: Optional[ServiceType] = None,
                date: Optional[date] = None, startTime: Optional[time] = None,
