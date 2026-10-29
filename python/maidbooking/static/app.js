@@ -152,7 +152,8 @@ function armedButton(text, armedText, action, extra) {
     }
     clearTimeout(timer);
     btn.disabled = true;
-    action();
+    // Buttons on a page that stays put go back to normal once the action finishes.
+    Promise.resolve(action()).finally(() => { btn.disabled = false; btn.classList.remove("armed"); btn.textContent = text; });
   });
   return btn;
 }
@@ -187,7 +188,7 @@ const activeTotal = (b) => b.occurrences.filter((o) => o.status !== "CANCELLED")
 
 /* ===================== routing ===================== */
 
-const routes = { home: renderHome, details: renderDetails, maids: renderMaids, bookings: renderBookings, booking: renderBookingDetails, account: renderAccount, partner: renderPartner };
+const routes = { home: renderHome, details: renderDetails, maids: renderMaids, bookings: renderBookings, booking: renderBookingDetails, account: renderAccount, partner: renderPartner, manage: renderManage };
 const TAB_SCREENS = new Set(["home", "bookings", "account"]);
 
 function clearTimers() { state.timers.forEach(clearInterval); state.timers = []; }
@@ -293,12 +294,15 @@ async function seedMaids() {
   const btn = document.getElementById("seed-btn");
   if (btn) btn.disabled = true;
   try {
-    for (const s of SAMPLE_MAIDS) {
+    // Skip samples that are already there, so tapping the button twice does not create duplicates.
+    const existing = new Set((await api("/api/maids/search?limit=100")).map((m) => `${m.name}|${m.locality}`));
+    const todo = SAMPLE_MAIDS.filter((s) => !existing.has(`${s.name}|${s.locality}`));
+    for (const s of todo) {
       await api("/api/maids", { method: "POST", body: {
         name: s.name, locality: s.locality, gender: s.gender, rating: s.rating, hourlyRates: s.hourlyRates, skills: s.skills,
         availability: s.days.map((day) => ({ day, start: s.start, end: s.end })) } });
     }
-    toast("Added 3 sample maids");
+    toast(todo.length ? `Added ${todo.length} sample ${todo.length === 1 ? "maid" : "maids"}` : "The sample maids are already added");
     await refreshLocalities();
     route();
   } catch (err) {
@@ -528,8 +532,12 @@ async function renderMaids(view) {
     remember(page.items);
     if (!shown) cards.replaceChildren();
     if (!page.total) {
-      cards.replaceChildren(el("div", { class: "empty", id: "no-match" }, el("h3", null, "No maid is free then"), el("p", null, "Try another time, date or duration."),
-        el("a", { class: "btn primary", href: `#/details/${f.service}/keep` }, "Change details")));
+      cards.replaceChildren(f.mode === "NOW"
+        ? el("div", { class: "empty", id: "no-match" }, el("h3", null, "No maid is free right now"),
+          el("p", null, "Maids work set hours and may already be booked. You can schedule a visit for later today or another day."),
+          el("button", { class: "btn primary", type: "button", id: "schedule-later", onclick: () => { f.mode = "ONE"; f.time = null; f.slots = null; go(`#/details/${f.service}/keep`); } }, "Schedule for later"))
+        : el("div", { class: "empty", id: "no-match" }, el("h3", null, "No maid is free then"), el("p", null, "Try another time, date or duration."),
+          el("a", { class: "btn primary", href: `#/details/${f.service}/keep` }, "Change details")));
       return;
     }
     cards.append(...page.items.map(card));
@@ -778,6 +786,7 @@ function renderAccount(view) {
     el("div", { class: "card" }, el("h3", null, "For partners"),
       el("p", { class: "sub", style: "margin-bottom:10px" }, "Onboard a maid with her services, rates and working hours."),
       el("div", { class: "stack" }, el("a", { class: "btn primary block", id: "add-maid-link", href: "#/partner", style: "text-align:center;text-decoration:none" }, "Add a maid"),
+        el("a", { class: "btn block", id: "manage-maids-link", href: "#/manage", style: "text-align:center;text-decoration:none" }, "Manage maids"),
         el("button", { class: "btn block", type: "button", id: "seed-btn", onclick: seedMaids }, "Add 3 sample maids"))));
 }
 
@@ -828,6 +837,79 @@ function renderPartner(view) {
       go("#/home");
     } catch (err) { fail(err.message); }
   });
+}
+
+/* ===================== manage maids ===================== */
+
+async function removeMaid(maid, cancelUpcoming) {
+  try {
+    const r = await api(`/api/maids/${maid.id}${cancelUpcoming ? "?cancelUpcoming=true" : ""}`, { method: "DELETE" });
+    toast(r.cancelledVisits ? `${maid.name} removed. ${r.cancelledVisits} ${r.cancelledVisits === 1 ? "visit" : "visits"} cancelled, ${moneyExact(r.totalRefund)} refunded.` : `${maid.name} removed`);
+    return { removed: true };
+  } catch (err) {
+    if (err.code === "MAID_HAS_UPCOMING_BOOKINGS") {
+      const n = Number((err.message.match(/has (\d+) upcoming/) || [])[1]) || 1;
+      return { removed: false, blocked: `${maid.name} has ${n} upcoming ${n === 1 ? "visit" : "visits"}. Cancel them, with full refunds, to remove her.` };
+    }
+    toast(err.message, "err");
+    return { removed: false };
+  }
+}
+
+async function renderManage(view) {
+  const blocked = new Map();   // maid id -> why she could not be removed
+  const banner = el("div", { id: "manage-banner" });
+  const list = el("div", { id: "manage-list" }, el("p", { class: "sub", style: "padding:12px 16px" }, "Loading…"));
+  let maids = [], total = 0;
+
+  const isSample = (m) => SAMPLE_MAIDS.some((s) => s.name === m.name && s.locality === m.locality);
+  const reload = async () => {
+    const page = await api("/api/maids/search?limit=100", { withTotal: true });
+    maids = page.items; total = page.total;
+    remember(maids);
+    await refreshLocalities();
+    draw();
+  };
+  const removeOne = async (m, force) => {
+    const result = await removeMaid(m, force);
+    if (result.blocked) blocked.set(m.id, result.blocked); else blocked.delete(m.id);
+    await reload();
+  };
+  const removeSamples = async (force) => {
+    const targets = maids.filter(isSample);
+    if (!targets.length) { toast("No sample maids found"); return; }
+    let removed = 0;
+    for (const m of targets) {
+      const result = await removeMaid(m, force);
+      if (result.removed) removed += 1; else if (result.blocked) blocked.set(m.id, result.blocked);
+    }
+    await reload();
+    banner.replaceChildren();
+    const stuck = maids.filter((m) => isSample(m) && blocked.has(m.id));
+    if (stuck.length) {
+      banner.append(el("div", { class: "card" }, el("div", { class: "note warn", id: "samples-blocked" },
+        `${stuck.length} sample ${stuck.length === 1 ? "maid has" : "maids have"} upcoming visits, so ${stuck.length === 1 ? "she was" : "they were"} kept.`),
+        el("div", { class: "actions", style: "margin:12px 0 0" }, armedButton("Cancel their visits (full refunds) and remove", "Confirm cancel and remove", () => removeSamples(true), "block"))));
+    }
+  };
+
+  const draw = () => {
+    if (!maids.length) { list.replaceChildren(el("div", { class: "empty", id: "no-maids-left" }, el("h3", null, "No maids"), el("p", null, "Add a maid or load the sample maids from the Account tab."))); return; }
+    list.replaceChildren(...maids.map((m) => el("article", { class: "card maid", "data-maid": m.name, "data-id": m.id },
+      el("div", { class: "maid-top" }, el("div", { class: "avatar", "aria-hidden": "true" }, m.name.charAt(0).toUpperCase()),
+        el("div", null, el("h3", null, m.name), el("div", { class: "sub" }, `${m.locality} · ★ ${Number(m.rating).toFixed(1)} · ${Object.keys(m.hourlyRates).map((k) => SERVICE_TITLES[k]).join(", ")}`))),
+      blocked.has(m.id) ? el("div", { class: "note warn" }, blocked.get(m.id)) : null,
+      el("div", { class: "actions", style: "margin:0" },
+        blocked.has(m.id) ? armedButton("Cancel visits and remove", "Confirm cancel and remove", () => removeOne(m, true), "remove-force")
+          : armedButton("Remove", "Confirm remove", () => removeOne(m, false), "remove")))));
+    if (total > maids.length) list.append(el("p", { class: "sub", style: "padding:0 16px" }, `Showing the first ${maids.length} of ${total} maids.`));
+  };
+
+  view.append(topbar("Manage maids", { back: () => go("#/account") }),
+    el("div", { class: "card" },
+      el("p", { class: "sub", style: "margin-bottom:10px" }, "Removing a maid hides her from search and booking. Bookings she already has keep her name. If she has upcoming visits you can cancel them too, and they are refunded in full."),
+      armedButton("Remove sample maids", "Confirm remove sample maids", () => removeSamples(false), "block sample-remove")), banner, list);
+  await reload();
 }
 
 /* ===================== boot ===================== */

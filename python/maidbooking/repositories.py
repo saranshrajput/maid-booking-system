@@ -21,6 +21,8 @@ class MaidQuery:
 
     # With a service type the cap applies to that service's rate, otherwise to any offered rate.
     def matches(self, m: Maid) -> bool:
+        if not m.active:
+            return False
         if self.locality and not m.serves_locality(self.locality):
             return False
         if self.gender and m.gender != self.gender:
@@ -119,14 +121,14 @@ class InMemoryMaidRepository(MaidRepository):
 
     def localities(self):
         with self._lock:
-            return sorted({m.locality for m in self._store.values()})
+            return sorted({m.locality for m in self._store.values() if m.active})
 
     def service_summary(self, locality):
         summary: dict = {}
         with self._lock:
             maids = list(self._store.values())
         for m in maids:
-            if locality and not m.serves_locality(locality):
+            if not m.active or (locality and not m.serves_locality(locality)):
                 continue
             for service, rate in m.hourly_rates.items():
                 count, lowest = summary.get(service, (0, rate))

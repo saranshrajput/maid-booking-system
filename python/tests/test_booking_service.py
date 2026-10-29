@@ -125,3 +125,35 @@ def test_busy_slots_report_only_active_overlapping_slots(ctx, maid):
 
     ctx.cancellations.cancel(booking.id)
     assert ctx.booking_repo.find_busy_slots([maid.id], day) == {}
+
+
+def test_removed_maid_is_hidden_and_cannot_be_booked_but_old_bookings_still_resolve(ctx, maid):
+    from maidbooking.search import MaidSearchCriteria
+    finished = ctx.book_scheduled(maid, TOMORROW_10, 60)
+    ctx.cancellations.cancel(finished.id)           # nothing upcoming is left
+    ctx.maids.deactivate(maid.id)
+
+    assert ctx.search.search(MaidSearchCriteria()) == []
+    assert ctx.maid_repo.localities() == []
+    assert ctx.maid_repo.service_summary(None) == {}
+    assert ctx.maids.get(maid.id).active is False   # bookings can still show her name
+    with pytest.raises(InvalidRequestError):
+        ctx.book_scheduled(maid, TOMORROW_10.replace(hour=14), 60)
+
+
+def test_removing_a_maid_counts_upcoming_visits_and_can_cancel_them_with_full_refunds(ctx, maid):
+    from decimal import Decimal
+    from maidbooking.domain import BookingStatus, PaymentMethodType
+    from maidbooking.services import PayCommand
+    paid = ctx.book_scheduled(maid, TOMORROW_10, 60)                       # within 24h: policy would refund 50%
+    ctx.payments.pay(paid.id, PayCommand(PaymentMethodType.WALLET, "wallet-1"))
+    held = ctx.book_scheduled(maid, TOMORROW_10.replace(hour=14), 60)      # unpaid hold
+    assert ctx.maids.count_upcoming_visits(maid.id) == 2
+
+    ctx.maids.deactivate(maid.id)
+    cancelled, refund = ctx.cancellations.cancel_upcoming_for_maid(maid.id)
+
+    assert (cancelled, refund) == (2, Decimal("200.00"))                    # full refund although inside 24h
+    assert ctx.bookings.get(paid.id).status == BookingStatus.CANCELLED
+    assert ctx.bookings.get(held.id).status == BookingStatus.CANCELLED
+    assert ctx.maids.count_upcoming_visits(maid.id) == 0

@@ -6,7 +6,7 @@ from datetime import datetime, time
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import (JSON, DateTime, Float, ForeignKey, Index, Numeric, String, create_engine, delete, distinct, func,
+from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Index, Numeric, String, create_engine, delete, distinct, func,
                         select, text)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload, sessionmaker
@@ -31,6 +31,7 @@ class MaidRow(Base):
     hourly_rates: Mapped[dict] = mapped_column(JSON)
     skills: Mapped[list] = mapped_column(JSON)
     availability: Mapped[list] = mapped_column(JSON)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
 
 
 class MaidServiceRow(Base):
@@ -114,7 +115,7 @@ class SqlMaidRepository(MaidRepository):
                 id=maid.id, name=maid.name, locality=maid.locality, gender=maid.gender.value, rating=maid.rating,
                 hourly_rates={k.value: str(v) for k, v in maid.hourly_rates.items()}, skills=sorted(maid.skills),
                 availability=[{"day": int(w.day), "start": w.start.isoformat(), "end": w.end.isoformat()}
-                              for w in maid.availability]))
+                              for w in maid.availability], active=maid.active))
             s.flush()
             s.execute(delete(MaidServiceRow).where(MaidServiceRow.maid_id == maid.id))
             s.add_all(_service_rows(maid.id, maid.hourly_rates))
@@ -127,7 +128,7 @@ class SqlMaidRepository(MaidRepository):
 
     @staticmethod
     def _filtered(q: MaidQuery):
-        stmt = select(MaidRow)
+        stmt = select(MaidRow).where(MaidRow.active.is_(True))
         if q.locality:
             stmt = stmt.where(func.lower(MaidRow.locality) == q.locality.strip().lower())
         if q.gender:
@@ -158,14 +159,15 @@ class SqlMaidRepository(MaidRepository):
 
     def localities(self) -> list[str]:
         with self._sessions() as s:
-            return list(s.scalars(select(distinct(MaidRow.locality)).order_by(MaidRow.locality)))
+            return list(s.scalars(select(distinct(MaidRow.locality)).where(MaidRow.active.is_(True))
+                                  .order_by(MaidRow.locality)))
 
     def service_summary(self, locality: Optional[str]) -> dict:
-        stmt = select(MaidServiceRow.service_type, func.count(), func.min(MaidServiceRow.hourly_rate)).group_by(
-            MaidServiceRow.service_type)
+        stmt = (select(MaidServiceRow.service_type, func.count(), func.min(MaidServiceRow.hourly_rate))
+                .join(MaidRow, MaidRow.id == MaidServiceRow.maid_id).where(MaidRow.active.is_(True))
+                .group_by(MaidServiceRow.service_type))
         if locality and locality.strip():
-            stmt = stmt.join(MaidRow, MaidRow.id == MaidServiceRow.maid_id).where(
-                func.lower(MaidRow.locality) == locality.strip().lower())
+            stmt = stmt.where(func.lower(MaidRow.locality) == locality.strip().lower())
         with self._sessions() as s:
             return {ServiceType(t): (n, Decimal(rate)) for t, n, rate in s.execute(stmt)}
 
@@ -174,7 +176,8 @@ class SqlMaidRepository(MaidRepository):
         return Maid(r.id, r.name, r.locality, Gender(r.gender), r.rating,
                     {ServiceType(k): Decimal(v) for k, v in r.hourly_rates.items()}, frozenset(r.skills),
                     [AvailabilityWindow(DayOfWeek(w["day"]), time.fromisoformat(w["start"]),
-                                        time.fromisoformat(w["end"])) for w in r.availability])
+                                        time.fromisoformat(w["end"])) for w in r.availability],
+                    active=r.active is not False)
 
 
 class SqlBookingRepository(BookingRepository):
@@ -303,6 +306,9 @@ class PostgresAdvisoryLockManager(LockManager):
 
 def create_schema(engine: Engine) -> None:
     Base.metadata.create_all(engine)
+    if engine.dialect.name == "postgresql":  # create_all never alters a table that already exists
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE maids ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE"))
     # create_all skips tables that already exist, so add any newer indexes to them explicitly.
     for table in Base.metadata.sorted_tables:
         for index in table.indexes:
