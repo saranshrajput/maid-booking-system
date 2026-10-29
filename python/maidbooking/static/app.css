@@ -183,12 +183,14 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .pill.completed { background: var(--green-soft); color: var(--green); }
 .pill.inprogress, .pill.pending { background: var(--amber-soft); color: var(--amber); }
 .pill.cancelled { background: var(--red-soft); color: var(--red); }
+.pill.expired { background: var(--grey-soft, #ececf3); color: var(--muted); }
 .visits { border-top: 1px solid var(--line); padding: 4px 14px 10px; background: #fcfbff; }
 .visit { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--line); text-decoration: none; color: inherit; }
 .visit:last-child { border-bottom: 0; }
 .datebadge { width: 42px; height: 46px; border: 1.5px solid var(--brand-2); border-radius: 10px; text-align: center; color: var(--brand); display: flex; flex-direction: column; justify-content: center; line-height: 1.1; flex: none; background: var(--surface); }
 .datebadge b { font-size: 17px; }
 .datebadge small { font-size: 9.5px; font-weight: 700; letter-spacing: .06em; }
+.datebadge.expired { border-color: #c9c6d9; color: var(--muted); }
 .datebadge.cancelled { border-color: #e9a7a7; color: var(--red); }
 .datebadge.completed { border-color: #8ccaa4; color: var(--green); }
 .visit .info { flex: 1; min-width: 0; font-size: 13px; }
@@ -206,6 +208,7 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .statusbar.completed { background: #2c7a55; }
 .statusbar.pending { background: #b86e00; }
 .statusbar.cancelled { background: #8c3b3b; }
+.statusbar.expired { background: #5d5a73; }
 .ring { width: 92px; height: 92px; flex: none; }
 .ring text { fill: #fff; }
 .pull { margin-top: -26px; position: relative; }
@@ -219,6 +222,7 @@ fieldset { border: 0; margin: 0; padding: 0; min-width: 0; }
 .dot.inprogress { background: #f5b800; border-color: #f5b800; color: #3d2a00; }
 .dot.upcoming { border-color: var(--brand-2); color: var(--brand); }
 .dot.pending { border-color: #e0a100; color: var(--amber); background: var(--amber-soft); }
+.dot.expired { background: #ececf3; border-color: #c9c6d9; color: var(--muted); text-decoration: line-through; }
 .dot.cancelled { background: var(--red-soft); border-color: #e9a7a7; color: var(--red); text-decoration: line-through; }
 .dot[aria-pressed="true"] { box-shadow: 0 0 0 3px var(--brand-soft), 0 0 0 5px var(--brand-2); }
 .actions { display: grid; gap: 8px; margin: 12px 16px; }

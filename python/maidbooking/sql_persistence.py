@@ -6,14 +6,15 @@ from datetime import datetime, time
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Index, Numeric, String, create_engine, delete, distinct, func,
-                        select, text)
+from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Index, Numeric, String, and_, create_engine, delete,
+                        distinct, func, or_, select, text)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload, sessionmaker
 
 from .domain import (AvailabilityWindow, Booking, BookingOccurrence, BookingType, DayOfWeek, Gender, Maid,
                      OccurrenceStatus, Payment, PaymentMethodType, PaymentStatus, ServiceType, TimeSlot)
-from .repositories import BookingRepository, IdempotencyStore, MaidQuery, MaidRepository, PaymentRepository
+from .repositories import (BookingRepository, IdempotencyRecord, IdempotencyStore, MaidQuery, MaidRepository,
+                           PaymentRepository)
 from .services import LockManager, MaidLockManager
 
 
@@ -51,6 +52,7 @@ class OccurrenceRow(Base):
     end_at: Mapped[datetime] = mapped_column(DateTime)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     status: Mapped[str] = mapped_column(String(20))
+    hold_expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
 
 
 class BookingRow(Base):
@@ -86,6 +88,9 @@ class IdempotencyRow(Base):
     __tablename__ = "idempotency_keys"
     key: Mapped[str] = mapped_column(String(200), primary_key=True)
     payment_ids: Mapped[list] = mapped_column(JSON)
+    fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    state: Mapped[str] = mapped_column(String(12), default="COMPLETED", server_default=text("'COMPLETED'"))
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
 
 def normalize_url(url: str) -> str:
@@ -190,7 +195,8 @@ class SqlBookingRepository(BookingRepository):
                 id=booking.id, customer_id=booking.customer_id, maid_id=booking.maid_id,
                 service_type=booking.service_type.value, booking_type=booking.booking_type.value,
                 occurrences=[OccurrenceRow(id=o.id, booking_id=booking.id, start_at=o.slot.start, end_at=o.slot.end,
-                                           price=o.price, status=o.status.value) for o in booking.occurrences]))
+                                           price=o.price, status=o.status.value, hold_expires_at=o.hold_expires_at)
+                             for o in booking.occurrences]))
         return booking
 
     def find_by_id(self, id: str) -> Optional[Booking]:
@@ -203,18 +209,27 @@ class SqlBookingRepository(BookingRepository):
             rows = s.scalars(select(BookingRow).where(BookingRow.maid_id == maid_id))
             return [self._to_domain(r) for r in rows]
 
-    def find_busy_slots(self, maid_ids: list[str], window: TimeSlot) -> dict:
+    def find_busy_slots(self, maid_ids: list[str], window: TimeSlot, now: datetime) -> dict:
         if not maid_ids:
             return {}
+        blocks = or_(OccurrenceRow.status == OccurrenceStatus.CONFIRMED.value,
+                     and_(OccurrenceRow.status == OccurrenceStatus.PENDING_PAYMENT.value, OccurrenceRow.hold_expires_at > now))
         stmt = (select(BookingRow.maid_id, OccurrenceRow.start_at, OccurrenceRow.end_at)
                 .join(OccurrenceRow, OccurrenceRow.booking_id == BookingRow.id)
-                .where(BookingRow.maid_id.in_(maid_ids), OccurrenceRow.status != OccurrenceStatus.CANCELLED.value,
+                .where(BookingRow.maid_id.in_(maid_ids), blocks,
                        OccurrenceRow.start_at < window.end, OccurrenceRow.end_at > window.start))
         busy: dict = {}
         with self._sessions() as s:
             for maid_id, start, end in s.execute(stmt):
                 busy.setdefault(maid_id, []).append(TimeSlot(start, end))
         return busy
+
+    def find_with_expired_holds(self, now: datetime, limit: int) -> list[Booking]:
+        lapsed = and_(OccurrenceRow.status == OccurrenceStatus.PENDING_PAYMENT.value,
+                      or_(OccurrenceRow.hold_expires_at.is_(None), OccurrenceRow.hold_expires_at <= now))
+        ids = select(OccurrenceRow.booking_id).where(lapsed).distinct().limit(limit)
+        with self._sessions() as s:
+            return [self._to_domain(r) for r in s.scalars(select(BookingRow).where(BookingRow.id.in_(ids)))]
 
     def find_by_customer_id(self, customer_id: str) -> list[Booking]:
         with self._sessions() as s:
@@ -225,7 +240,7 @@ class SqlBookingRepository(BookingRepository):
     def _to_domain(r: BookingRow) -> Booking:
         occurrences = []
         for o in r.occurrences:
-            occurrence = BookingOccurrence(o.id, TimeSlot(o.start_at, o.end_at), Decimal(o.price))
+            occurrence = BookingOccurrence(o.id, TimeSlot(o.start_at, o.end_at), Decimal(o.price), o.hold_expires_at)
             occurrence.status = OccurrenceStatus(o.status)
             occurrences.append(occurrence)
         return Booking(r.id, r.customer_id, r.maid_id, ServiceType(r.service_type), BookingType(r.booking_type),
@@ -263,18 +278,34 @@ class SqlPaymentRepository(PaymentRepository):
 
 
 class SqlIdempotencyStore(IdempotencyStore):
-    def __init__(self, engine: Engine, payments: SqlPaymentRepository):
+    def __init__(self, engine: Engine):
         self._sessions = sessionmaker(engine, expire_on_commit=False)
-        self._payments = payments
 
-    def find(self, key: str) -> Optional[list[Payment]]:
+    def find(self, key: str, now: datetime) -> Optional[IdempotencyRecord]:
         with self._sessions() as s:
             row = s.get(IdempotencyRow, key)
-        return self._payments.find_by_ids(row.payment_ids) if row else None
+        # Rows written before keys expired have no expiry and count as expired.
+        if row is None or row.expires_at is None or row.expires_at <= now:
+            return None
+        return IdempotencyRecord(row.key, row.fingerprint, row.state, tuple(row.payment_ids or ()), row.expires_at)
 
-    def save(self, key: str, result: list[Payment]) -> None:
+    def begin(self, key: str, fingerprint: str, expires_at: datetime) -> None:
         with self._sessions.begin() as s:
-            s.merge(IdempotencyRow(key=key, payment_ids=[p.id for p in result]))
+            s.merge(IdempotencyRow(key=key, payment_ids=[], fingerprint=fingerprint, state=self.PROCESSING, expires_at=expires_at))
+
+    def complete(self, key: str, payment_ids: list[str]) -> None:
+        with self._sessions.begin() as s:
+            row = s.get(IdempotencyRow, key)
+            row.payment_ids, row.state = list(payment_ids), self.COMPLETED
+
+    def release(self, key: str) -> None:
+        with self._sessions.begin() as s:
+            s.execute(delete(IdempotencyRow).where(IdempotencyRow.key == key))
+
+    def purge_expired(self, now: datetime) -> int:
+        with self._sessions.begin() as s:
+            return s.execute(delete(IdempotencyRow).where(
+                or_(IdempotencyRow.expires_at.is_(None), IdempotencyRow.expires_at <= now))).rowcount
 
 
 class PostgresAdvisoryLockManager(LockManager):
@@ -309,6 +340,10 @@ def create_schema(engine: Engine) -> None:
     if engine.dialect.name == "postgresql":  # create_all never alters a table that already exists
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE maids ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE"))
+            conn.execute(text("ALTER TABLE booking_occurrences ADD COLUMN IF NOT EXISTS hold_expires_at TIMESTAMP NULL"))
+            conn.execute(text("ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS fingerprint VARCHAR(64) NULL"))
+            conn.execute(text("ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS state VARCHAR(12) NOT NULL DEFAULT 'COMPLETED'"))
+            conn.execute(text("ALTER TABLE idempotency_keys ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP NULL"))
     # create_all skips tables that already exist, so add any newer indexes to them explicitly.
     for table in Base.metadata.sorted_tables:
         for index in table.indexes:

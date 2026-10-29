@@ -155,3 +155,37 @@ def test_removing_a_maid_over_the_api():
     assert client.post("/api/bookings", json=body).status_code == 400       # but nobody can book her
     assert client.delete(f"/api/maids/{keep}").json()["removed"] is True    # no upcoming visits: removed at once
     assert client.delete("/api/maids/nope").status_code == 404
+
+
+def test_holds_and_idempotency_over_the_api():
+    from datetime import timedelta
+    clock = {"now": datetime(2030, 1, 7, 10, 0)}
+    app = create_app(clock=lambda: clock["now"], sweep_seconds=0)
+    client = TestClient(app)
+    maid_id = client.post("/api/maids", json=MAID).json()["id"]
+    body = {"customerId": "c", "maidId": maid_id, "serviceType": "CLEANING", "bookingType": "SCHEDULED",
+            "durationMinutes": 60, "startDateTime": "2030-01-09T10:00"}
+
+    first = client.post("/api/bookings", json=body).json()
+    assert first["occurrences"][0]["holdExpiresAt"] == "2030-01-07T10:10:00"
+    assert client.post("/api/bookings", json=body).status_code == 409          # the hold blocks the slot
+
+    clock["now"] += timedelta(minutes=11)
+    second = client.post("/api/bookings", json=body)                           # the hold lapsed: the slot is free
+    assert second.status_code == 201
+    pay = {"method": "WALLET", "instrument": "wallet-1"}
+    assert client.post(f"/api/bookings/{second.json()['id']}/payments", json=pay).status_code == 201
+
+    late = client.post(f"/api/bookings/{first['id']}/payments", json=pay)      # the first customer pays too late
+    assert late.status_code == 409 and late.json()["code"] == "HOLD_EXPIRED"
+
+    app.state.hold_expiry.sweep()
+    assert client.get(f"/api/bookings/{first['id']}").json()["status"] == "EXPIRED"
+    assert client.get(f"/api/bookings/{first['id']}").json()["occurrences"][0]["status"] == "EXPIRED"
+
+    third = client.post("/api/bookings", json={**body, "startDateTime": "2030-01-10T10:00"}).json()
+    headers = {"Idempotency-Key": "k1"}
+    assert client.post(f"/api/bookings/{third['id']}/payments", json=pay, headers=headers).status_code == 201
+    assert client.post(f"/api/bookings/{third['id']}/payments", json=pay, headers=headers).status_code == 201   # replay
+    reused = client.post(f"/api/bookings/{third['id']}/payments", json={**pay, "instrument": "wallet-2"}, headers=headers)
+    assert reused.status_code == 422 and reused.json()["code"] == "IDEMPOTENCY_KEY_REUSED"

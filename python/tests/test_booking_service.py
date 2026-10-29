@@ -118,13 +118,13 @@ def test_busy_slots_report_only_active_overlapping_slots(ctx, maid):
     other = ctx.maid("Other", "Koramangala")
     day = TimeSlot(datetime(2030, 1, 8, 0, 0), datetime(2030, 1, 9, 0, 0))
 
-    busy = ctx.booking_repo.find_busy_slots([maid.id, other.id], day)
+    busy = ctx.booking_repo.find_busy_slots([maid.id, other.id], day, ctx.now)
     assert busy == {maid.id: [booking.occurrences[0].slot]}
-    assert ctx.booking_repo.find_busy_slots([maid.id], TimeSlot(datetime(2030, 1, 8, 11, 0), datetime(2030, 1, 8, 12, 0))) == {}
-    assert ctx.booking_repo.find_busy_slots([], day) == {}
+    assert ctx.booking_repo.find_busy_slots([maid.id], TimeSlot(datetime(2030, 1, 8, 11, 0), datetime(2030, 1, 8, 12, 0)), ctx.now) == {}
+    assert ctx.booking_repo.find_busy_slots([], day, ctx.now) == {}
 
     ctx.cancellations.cancel(booking.id)
-    assert ctx.booking_repo.find_busy_slots([maid.id], day) == {}
+    assert ctx.booking_repo.find_busy_slots([maid.id], day, ctx.now) == {}
 
 
 def test_removed_maid_is_hidden_and_cannot_be_booked_but_old_bookings_still_resolve(ctx, maid):

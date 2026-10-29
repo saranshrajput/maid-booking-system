@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum, IntEnum
+from typing import Optional
 
 from .exceptions import InvalidRequestError, InvalidStateError
 
@@ -43,12 +44,14 @@ class OccurrenceStatus(str, Enum):
     PENDING_PAYMENT = "PENDING_PAYMENT"
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"  # an unpaid hold that ran out
 
 
 class BookingStatus(str, Enum):
     AWAITING_PAYMENT = "AWAITING_PAYMENT"
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
 
 
 class PaymentMethodType(str, Enum):
@@ -175,28 +178,54 @@ class Maid:
 
 
 class BookingOccurrence:
-    """One bookable slot; instant/scheduled bookings have one, recurring bookings have many."""
+    """One bookable slot; instant/scheduled bookings have one, recurring bookings have many.
 
-    def __init__(self, id: str, slot: TimeSlot, price: Decimal):
+    PENDING_PAYMENT -> CONFIRMED (paid) | CANCELLED | EXPIRED (hold ran out).
+    EXPIRED -> PENDING_PAYMENT again if the customer pays while the slot is still free (renew_hold).
+    A pending occurrence only blocks the maid until `hold_expires_at`; a missing deadline counts as already passed."""
+
+    def __init__(self, id: str, slot: TimeSlot, price: Decimal, hold_expires_at: Optional[datetime] = None):
         self.id = id
         self.slot = slot
         self.price = price
         self.status = OccurrenceStatus.PENDING_PAYMENT
+        self.hold_expires_at = hold_expires_at
 
     def confirm(self):
         if self.status != OccurrenceStatus.PENDING_PAYMENT:
             raise InvalidStateError(f"Occurrence {self.id} cannot be confirmed from {self.status.value}")
         self.status = OccurrenceStatus.CONFIRMED
+        self.hold_expires_at = None
 
     def cancel(self):
-        if self.status == OccurrenceStatus.CANCELLED:
-            raise InvalidStateError(f"Occurrence {self.id} is already cancelled")
+        if self.status in (OccurrenceStatus.CANCELLED, OccurrenceStatus.EXPIRED):
+            raise InvalidStateError(f"Occurrence {self.id} is already {self.status.value.lower()}")
         self.status = OccurrenceStatus.CANCELLED
+        self.hold_expires_at = None
 
-    # Active occurrences hold the maid's slot.
+    def expire(self):
+        if self.status != OccurrenceStatus.PENDING_PAYMENT:
+            raise InvalidStateError(f"Occurrence {self.id} cannot expire from {self.status.value}")
+        self.status = OccurrenceStatus.EXPIRED
+
+    def renew_hold(self, hold_until: datetime):
+        if self.status not in (OccurrenceStatus.PENDING_PAYMENT, OccurrenceStatus.EXPIRED):
+            raise InvalidStateError(f"Occurrence {self.id} has no hold to renew ({self.status.value})")
+        self.status = OccurrenceStatus.PENDING_PAYMENT
+        self.hold_expires_at = hold_until
+
+    # Not cancelled and not expired.
     @property
     def is_active(self) -> bool:
-        return self.status != OccurrenceStatus.CANCELLED
+        return self.status in (OccurrenceStatus.PENDING_PAYMENT, OccurrenceStatus.CONFIRMED)
+
+    def hold_lapsed(self, now: datetime) -> bool:
+        return (self.status == OccurrenceStatus.PENDING_PAYMENT
+                and (self.hold_expires_at is None or self.hold_expires_at <= now))
+
+    # Whether this occurrence keeps the maid busy at `now`: confirmed, or pending with a live hold.
+    def blocks(self, now: datetime) -> bool:
+        return self.is_active and not self.hold_lapsed(now)
 
 
 @dataclass
@@ -212,7 +241,8 @@ class Booking:
     @property
     def status(self) -> BookingStatus:
         if not any(o.is_active for o in self.occurrences):
-            return BookingStatus.CANCELLED
+            expired_only = all(o.status == OccurrenceStatus.EXPIRED for o in self.occurrences)
+            return BookingStatus.EXPIRED if expired_only else BookingStatus.CANCELLED
         if any(o.status == OccurrenceStatus.PENDING_PAYMENT for o in self.occurrences):
             return BookingStatus.AWAITING_PAYMENT
         return BookingStatus.CONFIRMED

@@ -70,8 +70,13 @@ class BookingRepository(ABC):
     def find_by_maid_id(self, maid_id: str) -> list[Booking]: ...
 
     @abstractmethod
-    def find_busy_slots(self, maid_ids: list[str], window: TimeSlot) -> dict[str, list[TimeSlot]]:
-        """Active (not cancelled) occurrence slots overlapping `window`, for many maids in one call."""
+    def find_busy_slots(self, maid_ids: list[str], window: TimeSlot, now: datetime) -> dict[str, list[TimeSlot]]:
+        """Slots that keep each maid busy at `now` and overlap `window`, for many maids in one call: confirmed
+        occurrences and unpaid ones whose hold has not lapsed (cancelled and expired ones never block)."""
+
+    @abstractmethod
+    def find_with_expired_holds(self, now: datetime, limit: int) -> list[Booking]:
+        """Bookings with at least one unpaid occurrence whose hold has lapsed, for the expiry sweeper."""
 
     @abstractmethod
     def find_by_customer_id(self, customer_id: str) -> list[Booking]: ...
@@ -88,12 +93,36 @@ class PaymentRepository(ABC):
     def find_by_ids(self, ids: list[str]) -> list[Payment]: ...
 
 
+@dataclass(frozen=True)
+class IdempotencyRecord:
+    key: str
+    fingerprint: Optional[str]      # hash of the request; None for records written by older releases
+    state: str                      # PROCESSING while the first attempt runs, COMPLETED afterwards
+    payment_ids: tuple
+    expires_at: datetime
+
+
 class IdempotencyStore(ABC):
-    @abstractmethod
-    def find(self, key: str) -> Optional[list[Payment]]: ...
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
 
     @abstractmethod
-    def save(self, key: str, result: list[Payment]) -> None: ...
+    def find(self, key: str, now: datetime) -> Optional[IdempotencyRecord]:
+        """The live record for the key, or None when there is none or it has expired."""
+
+    @abstractmethod
+    def begin(self, key: str, fingerprint: str, expires_at: datetime) -> None:
+        """Mark the key as being processed (replacing an expired record, if any)."""
+
+    @abstractmethod
+    def complete(self, key: str, payment_ids: list[str]) -> None: ...
+
+    @abstractmethod
+    def release(self, key: str) -> None:
+        """Forget the key, so a failed attempt can be retried."""
+
+    @abstractmethod
+    def purge_expired(self, now: datetime) -> int: ...
 
 
 class InMemoryMaidRepository(MaidRepository):
@@ -157,16 +186,21 @@ class InMemoryBookingRepository(BookingRepository):
         with self._lock:
             return [b for b in self._store.values() if b.customer_id == customer_id]
 
-    def find_busy_slots(self, maid_ids, window):
+    def find_busy_slots(self, maid_ids, window, now):
         wanted = set(maid_ids)
         with self._lock:
             bookings = [b for b in self._store.values() if b.maid_id in wanted]
         busy: dict = {}
         for b in bookings:
             for o in b.occurrences:
-                if o.is_active and o.slot.overlaps(window):
+                if o.blocks(now) and o.slot.overlaps(window):
                     busy.setdefault(b.maid_id, []).append(o.slot)
         return busy
+
+    def find_with_expired_holds(self, now, limit):
+        with self._lock:
+            found = [b for b in self._store.values() if any(o.hold_lapsed(now) for o in b.occurrences)]
+        return found[:limit]
 
 
 class InMemoryPaymentRepository(PaymentRepository):
@@ -191,10 +225,30 @@ class InMemoryPaymentRepository(PaymentRepository):
 
 class InMemoryIdempotencyStore(IdempotencyStore):
     def __init__(self):
-        self._store: dict[str, list[Payment]] = {}
+        self._store: dict[str, IdempotencyRecord] = {}
+        self._lock = threading.Lock()
 
-    def find(self, key):
-        return self._store.get(key)
+    def find(self, key, now):
+        with self._lock:
+            record = self._store.get(key)
+        return record if record and record.expires_at > now else None
 
-    def save(self, key, result):
-        self._store[key] = list(result)
+    def begin(self, key, fingerprint, expires_at):
+        with self._lock:
+            self._store[key] = IdempotencyRecord(key, fingerprint, self.PROCESSING, (), expires_at)
+
+    def complete(self, key, payment_ids):
+        with self._lock:
+            record = self._store[key]
+            self._store[key] = IdempotencyRecord(key, record.fingerprint, self.COMPLETED, tuple(payment_ids), record.expires_at)
+
+    def release(self, key):
+        with self._lock:
+            self._store.pop(key, None)
+
+    def purge_expired(self, now):
+        with self._lock:
+            stale = [k for k, r in self._store.items() if r.expires_at <= now]
+            for k in stale:
+                del self._store[k]
+        return len(stale)

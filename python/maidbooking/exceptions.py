@@ -24,3 +24,15 @@ class PaymentFailedError(MaidBookingError):
 
 class MaidHasUpcomingBookingsError(InvalidStateError):
     pass
+
+
+class HoldExpiredError(InvalidStateError):
+    pass
+
+
+class IdempotencyInProgressError(InvalidStateError):
+    pass
+
+
+class IdempotencyKeyReusedError(InvalidRequestError):
+    pass

@@ -18,7 +18,7 @@ from maidbooking.pricing import HourlyPricingStrategy  # noqa: E402
 from maidbooking.config import build_infrastructure  # noqa: E402
 from maidbooking.search import MaidSearchService  # noqa: E402
 from maidbooking.services import (AvailabilityService, BookingService, CancellationService,  # noqa: E402
-                                  MaidService, OnboardMaidCommand, PaymentService)
+                                  HoldExpiryService, MaidService, OnboardMaidCommand, PaymentService)
 
 NOW = datetime(2030, 1, 7, 10, 0)  # Monday
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")  # Postgres runs of the suite are skipped when unset.
@@ -37,14 +37,15 @@ class Ctx:
     """Real services over in-memory repositories with a fixed clock."""
 
     def __init__(self, database_url=None, reset=True):
-        clock = lambda: NOW  # noqa: E731
+        self.now = NOW  # tests move the clock by assigning ctx.now
+        clock = lambda: self.now  # noqa: E731
         infra = build_infrastructure(database_url)
         if database_url and reset:
             reset_database(database_url)
         self.maid_repo, self.booking_repo, self.payment_repo = infra.maids, infra.bookings, infra.payments
         self.engine = infra.engine  # None for the in-memory backend
         self.maids = MaidService(self.maid_repo, self.booking_repo, clock)
-        self.availability = AvailabilityService(self.booking_repo)
+        self.availability = AvailabilityService(self.booking_repo, clock)
         locks = infra.locks
         processors = PaymentProcessorRegistry([CardPaymentProcessor(), UpiPaymentProcessor(),
                                                WalletPaymentProcessor()])
@@ -53,7 +54,9 @@ class Ctx:
         self.bookings = BookingService(self.maids, self.booking_repo, strategies, self.availability,
                                        HourlyPricingStrategy(), locks, clock)
         self.payments = PaymentService(self.booking_repo, self.payment_repo, infra.idempotency,
-                                       processors, locks)
+                                       processors, locks, self.maids, self.availability, clock)
+        self.idempotency = infra.idempotency
+        self.hold_expiry = HoldExpiryService(self.booking_repo, infra.idempotency, locks, clock)
         self.cancellations = CancellationService(self.booking_repo, self.payment_repo, processors,
                                                  TimeBasedCancellationPolicy(), locks, clock)
         self.search = MaidSearchService(self.maid_repo, self.availability)
