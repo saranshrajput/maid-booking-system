@@ -1,3 +1,4 @@
+import hashlib
 import threading
 import uuid
 from abc import ABC, abstractmethod
@@ -11,8 +12,8 @@ from .booking_strategies import BookingCommand, BookingStrategyRegistry
 from .cancellation_policy import CancellationPolicy
 from .domain import (Booking, BookingOccurrence, Gender, Maid, OccurrenceStatus, Payment, PaymentMethodType,
                      PaymentStatus, ServiceType, TimeSlot)
-from .exceptions import (InvalidRequestError, InvalidStateError, NotFoundError, PaymentFailedError,
-                         SlotUnavailableError)
+from .exceptions import (HoldExpiredError, IdempotencyInProgressError, IdempotencyKeyReusedError, InvalidRequestError,
+                         InvalidStateError, NotFoundError, PaymentFailedError, SlotUnavailableError)
 from .payment_processors import PaymentProcessorRegistry
 from .pricing import PricingStrategy
 from .repositories import BookingRepository, IdempotencyStore, MaidRepository, PaymentRepository
@@ -40,17 +41,26 @@ class MaidLockManager(LockManager):
             return action()
 
 
+@dataclass(frozen=True)
+class HoldPolicy:
+    """How long an unpaid booking holds the maid's slot, and how long a payment idempotency key is remembered."""
+    ttl: timedelta = timedelta(minutes=10)
+    idempotency_ttl: timedelta = timedelta(hours=24)
+
+
 class AvailabilityService:
-    def __init__(self, bookings: BookingRepository):
+    def __init__(self, bookings: BookingRepository, clock: Callable[[], datetime]):
         self._bookings = bookings
+        self._clock = clock
 
     def is_available(self, maid: Maid, slot: TimeSlot) -> bool:
-        return maid.works_during(slot) and not self._bookings.find_busy_slots([maid.id], slot).get(maid.id)
+        busy = self._bookings.find_busy_slots([maid.id], slot, self._clock())
+        return maid.works_during(slot) and not busy.get(maid.id)
 
     def free_maids(self, maids: list[Maid], slot: TimeSlot) -> list[Maid]:
         """The maids free for `slot`, using one bookings query for all of them."""
         working = [m for m in maids if m.works_during(slot)]
-        busy = self._bookings.find_busy_slots([m.id for m in working], slot)
+        busy = self._bookings.find_busy_slots([m.id for m in working], slot, self._clock())
         return [m for m in working if not busy.get(m.id)]
 
     def start_time_counts(self, maids: list[Maid], day: date, duration_minutes: int, not_before: datetime,
@@ -59,7 +69,7 @@ class AvailabilityService:
         """For each candidate start time on `day`, how many of `maids` are free for `duration_minutes`.
         Starts that are not after `not_before` count as 0. One bookings query covers the whole day."""
         midnight = datetime.combine(day, time(0, 0))
-        busy = self._bookings.find_busy_slots([m.id for m in maids], TimeSlot(midnight, midnight + timedelta(days=1)))
+        busy = self._bookings.find_busy_slots([m.id for m in maids], TimeSlot(midnight, midnight + timedelta(days=1)), not_before)
         counts, start, last = [], datetime.combine(day, earliest), datetime.combine(day, latest)
         while start <= last:
             slot = TimeSlot.of(start, duration_minutes)
@@ -102,7 +112,7 @@ class MaidService:
         """Active visits that have not finished yet."""
         now = self._clock()
         return sum(1 for b in self._bookings.find_by_maid_id(maid_id) for o in b.occurrences
-                   if o.is_active and o.slot.end > now)
+                   if o.blocks(now) and o.slot.end > now)
 
     def deactivate(self, maid_id: str) -> Maid:
         """Hide the maid from search and booking. Old bookings keep her name."""
@@ -112,7 +122,7 @@ class MaidService:
 class BookingService:
     def __init__(self, maids: MaidService, bookings: BookingRepository, strategies: BookingStrategyRegistry,
                  availability: AvailabilityService, pricing: PricingStrategy, locks: LockManager,
-                 clock: Callable[[], datetime]):
+                 clock: Callable[[], datetime], holds: HoldPolicy = HoldPolicy()):
         self._maids = maids
         self._bookings = bookings
         self._strategies = strategies
@@ -120,6 +130,7 @@ class BookingService:
         self._pricing = pricing
         self._locks = locks
         self._clock = clock
+        self._holds = holds
 
     def book(self, cmd: BookingCommand) -> Booking:
         self._validate(cmd)
@@ -128,14 +139,16 @@ class BookingService:
             raise InvalidRequestError(f"{maid.name} is no longer available")
         if not maid.offers(cmd.service_type):
             raise InvalidRequestError(f"{maid.name} does not offer {cmd.service_type.value}")
-        slots = self._strategies.get(cmd.booking_type).resolve_slots(cmd, self._clock())
+        now = self._clock()
+        slots = self._strategies.get(cmd.booking_type).resolve_slots(cmd, now)
 
         # Check-then-save is atomic per maid, so concurrent requests cannot double-book.
         def create() -> Booking:
             for slot in slots:
                 if not self._availability.is_available(maid, slot):
                     raise SlotUnavailableError(f"{maid.name} is not available for {slot.start} - {slot.end}")
-            occurrences = [BookingOccurrence(str(uuid.uuid4()), s, self._pricing.price(maid, cmd.service_type, s))
+            hold_until = now + self._holds.ttl  # unpaid occurrences stop blocking the maid at this time
+            occurrences = [BookingOccurrence(str(uuid.uuid4()), s, self._pricing.price(maid, cmd.service_type, s), hold_until)
                            for s in slots]
             return self._bookings.save(Booking(str(uuid.uuid4()), cmd.customer_id, maid.id, cmd.service_type,
                                                cmd.booking_type, occurrences))
@@ -172,12 +185,17 @@ class PayCommand:
 
 class PaymentService:
     def __init__(self, bookings: BookingRepository, payments: PaymentRepository, idempotency: IdempotencyStore,
-                 processors: PaymentProcessorRegistry, locks: LockManager):
+                 processors: PaymentProcessorRegistry, locks: LockManager, maids: MaidService,
+                 availability: AvailabilityService, clock: Callable[[], datetime], holds: HoldPolicy = HoldPolicy()):
         self._bookings = bookings
         self._payments = payments
         self._idempotency = idempotency
         self._processors = processors
         self._locks = locks
+        self._maids = maids
+        self._availability = availability
+        self._clock = clock
+        self._holds = holds
 
     def pay(self, booking_id: str, cmd: PayCommand, idempotency_key: Optional[str] = None) -> list[Payment]:
         if cmd.method is None:
@@ -185,26 +203,70 @@ class PaymentService:
         booking = self._load(booking_id)
         processor = self._processors.get(cmd.method)
         key = f"{booking_id}:{idempotency_key}" if idempotency_key and idempotency_key.strip() else None
+        fingerprint = self._fingerprint(cmd)
 
-        # Same lock as booking/cancel, so the key lookup and the charge are atomic per maid.
+        # Same lock as booking/cancel, so the key lookup, the slot check and the charge are atomic per maid.
         def run() -> list[Payment]:
             booking = self._load(booking_id)  # Re-read under the lock so state is current.
-            if key and (previous := self._idempotency.find(key)) is not None:
-                return previous
-            payments = [self._charge(booking, o, cmd, processor)
-                        for o in self._payable(booking, cmd.occurrence_id)]
+            now = self._clock()
             if key:
-                self._idempotency.save(key, payments)
+                replay = self._replay(key, fingerprint, now)
+                if replay is not None:
+                    return replay
+            targets = self._payable(booking, cmd.occurrence_id, now)
+            self._check_slots_still_free(booking, targets, now)
+            if key:
+                self._idempotency.begin(key, fingerprint, now + self._holds.idempotency_ttl)
+            try:
+                payments = [self._charge(booking, o, cmd, processor, now) for o in targets]
+            except Exception:
+                if key:
+                    self._idempotency.release(key)  # a failed attempt may be retried with the same key
+                raise
+            if key:
+                self._idempotency.complete(key, [p.id for p in payments])
             return payments
 
         return self._locks.with_lock(booking.maid_id, run)
 
-    def _charge(self, booking, occurrence, cmd, processor) -> Payment:
+    # The same key with the same request returns the first result; with a different request it is an error.
+    def _replay(self, key: str, fingerprint: str, now: datetime) -> Optional[list[Payment]]:
+        record = self._idempotency.find(key, now)
+        if record is None:
+            return None
+        if record.fingerprint is not None and record.fingerprint != fingerprint:
+            raise IdempotencyKeyReusedError("This Idempotency-Key was already used with a different payment request")
+        if record.state == IdempotencyStore.PROCESSING:
+            raise IdempotencyInProgressError(
+                "An earlier attempt with this Idempotency-Key did not finish. Check the booking before paying again")
+        return self._payments.find_by_ids(list(record.payment_ids))
+
+    # Not the card or UPI id itself in the clear: a hash of the request, so the store never keeps the instrument.
+    @staticmethod
+    def _fingerprint(cmd: PayCommand) -> str:
+        raw = f"{cmd.method.value}|{cmd.instrument}|{cmd.occurrence_id or ''}"
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    # A hold that ran out (or was swept) can still be paid, but only while the slot is free: the maid may have been
+    # booked by someone else in the meantime. All visits are checked before anything is charged.
+    def _check_slots_still_free(self, booking: Booking, targets: list[BookingOccurrence], now: datetime) -> None:
+        lapsed = [o for o in targets if o.status == OccurrenceStatus.EXPIRED or o.hold_lapsed(now)]
+        if not lapsed:
+            return
+        maid = self._maids.get(booking.maid_id)
+        for occurrence in lapsed:
+            if not maid.active or not self._availability.is_available(maid, occurrence.slot):
+                raise HoldExpiredError("Your hold on this slot expired and the slot is no longer free")
+
+    def _charge(self, booking, occurrence, cmd, processor, now) -> Payment:
+        if occurrence.status == OccurrenceStatus.EXPIRED or occurrence.hold_lapsed(now):
+            occurrence.renew_hold(now + self._holds.ttl)  # the slot was just confirmed free
         result = processor.charge(occurrence.price, cmd.instrument)
         status = PaymentStatus.SUCCESS if result.success else PaymentStatus.FAILED
         payment = self._payments.save(Payment(str(uuid.uuid4()), booking.id, occurrence.id, occurrence.price,
                                               cmd.method, status, result.reference, result.failure_reason))
         if not result.success:
+            self._bookings.save(booking)
             raise PaymentFailedError(result.failure_reason)
         occurrence.confirm()
         self._bookings.save(booking)
@@ -217,18 +279,58 @@ class PaymentService:
         return booking
 
     @staticmethod
-    def _payable(booking: Booking, occurrence_id: Optional[str]) -> list[BookingOccurrence]:
+    def _payable(booking: Booking, occurrence_id: Optional[str], now: datetime) -> list[BookingOccurrence]:
+        payable = (OccurrenceStatus.PENDING_PAYMENT, OccurrenceStatus.EXPIRED)
         if occurrence_id is not None:
             target = next((o for o in booking.occurrences if o.id == occurrence_id), None)
             if target is None:
                 raise NotFoundError(f"Occurrence not found: {occurrence_id}")
-            if target.status != OccurrenceStatus.PENDING_PAYMENT:
+            if target.status not in payable:
                 raise InvalidStateError(f"Occurrence {occurrence_id} is {target.status.value}, not payable")
+            if target.slot.end <= now:
+                raise HoldExpiredError("This visit time has already passed")
             return [target]
-        unpaid = [o for o in booking.occurrences if o.status == OccurrenceStatus.PENDING_PAYMENT]
+        unpaid = [o for o in booking.occurrences if o.status in payable and o.slot.end > now]
         if not unpaid:
+            if any(o.status in payable for o in booking.occurrences):
+                raise HoldExpiredError("This visit time has already passed")
             raise InvalidStateError(f"Nothing to pay for booking {booking.id}")
         return unpaid
+
+
+class HoldExpiryService:
+    """Marks unpaid holds that ran out as EXPIRED and forgets old idempotency keys. Availability already ignores a
+    lapsed hold, so this is housekeeping that makes the state visible, not what frees the slot."""
+
+    BATCH = 200
+
+    def __init__(self, bookings: BookingRepository, idempotency: IdempotencyStore, locks: LockManager,
+                 clock: Callable[[], datetime]):
+        self._bookings = bookings
+        self._idempotency = idempotency
+        self._locks = locks
+        self._clock = clock
+
+    def sweep(self) -> tuple[int, int]:
+        """Returns (visits expired, idempotency keys purged). Safe to run on every instance at once."""
+        now, expired = self._clock(), 0
+
+        def expire_in(booking_id: str) -> int:
+            fresh = self._bookings.find_by_id(booking_id)
+            lapsed = [o for o in fresh.occurrences if o.hold_lapsed(now)]
+            for occurrence in lapsed:
+                occurrence.expire()
+            if lapsed:
+                self._bookings.save(fresh)
+            return len(lapsed)
+
+        while True:
+            batch = self._bookings.find_with_expired_holds(now, self.BATCH)
+            done = sum(self._locks.with_lock(b.maid_id, lambda b=b: expire_in(b.id)) for b in batch)
+            expired += done
+            if not batch or not done:
+                break
+        return expired, self._idempotency.purge_expired(now)
 
 
 @dataclass(frozen=True)
@@ -288,7 +390,7 @@ class CancellationService:
     # Cancellable while active and not yet finished.
     @staticmethod
     def _is_cancellable(occurrence: BookingOccurrence, now: datetime) -> bool:
-        return occurrence.is_active and occurrence.slot.end > now
+        return occurrence.blocks(now) and occurrence.slot.end > now
 
     # The maid is leaving, so the customer is not at fault: every unfinished visit is cancelled with a full refund.
     def cancel_upcoming_for_maid(self, maid_id: str) -> tuple[int, Decimal]:

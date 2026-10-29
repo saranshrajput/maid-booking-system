@@ -34,7 +34,7 @@ def build_infrastructure(database_url: Optional[str]) -> Infrastructure:
     create_schema(engine)
     payments = SqlPaymentRepository(engine)
     return Infrastructure(SqlMaidRepository(engine), SqlBookingRepository(engine), payments,
-                          SqlIdempotencyStore(engine, payments), PostgresAdvisoryLockManager(engine), engine)
+                          SqlIdempotencyStore(engine), PostgresAdvisoryLockManager(engine), engine)
 
 
 def local_clock(timezone: Optional[str] = None) -> Callable[[], datetime]:

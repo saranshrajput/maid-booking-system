@@ -24,7 +24,30 @@ The same FastAPI app serves a mobile-first web UI at `/` (files in `python/maidb
 
 "Upcoming", "in progress" and "completed" are derived in the browser from the server clock (`GET /api/meta`); the API itself only stores pending, confirmed and cancelled.
 
-Browser test (needs Node and the `playwright` package): `PYTHON=python ./python/e2e/run.sh` starts a fresh in-memory server and runs 55 checks across every screen, including slot greying, a payment decline, series payment and cancellation, removing maids and phone width, then 18 more on "Book now" against a server with a fixed clock (`e2e/fixed_clock_server.py`): a daytime run where an instant booking goes through to an in-progress visit, and a night run where nobody is free. Set `DATABASE_URL` to run the same flow against Postgres (the database must be empty).
+Browser test (needs Node and the `playwright` package): `PYTHON=python ./python/e2e/run.sh` starts a fresh in-memory server and runs 55 checks across every screen (plus 18 on hold expiry against a clock the test moves, and the "Book now" runs), including slot greying, a payment decline, series payment and cancellation, removing maids and phone width, then 18 more on "Book now" against a server with a fixed clock (`e2e/fixed_clock_server.py`): a daytime run where an instant booking goes through to an in-progress visit, and a night run where nobody is free. Set `DATABASE_URL` to run the same flow against Postgres (the database must be empty).
+
+## Holds and idempotency
+
+**Unpaid holds expire.** Booking holds the slot for `HOLD_MINUTES` (default 10). Each unpaid visit carries a deadline (`holdExpiresAt` in the API).
+
+- A lapsed hold stops blocking the maid immediately: availability, search and the start-time grid read "confirmed, or unpaid with a live hold", so nothing waits for a background job.
+- A sweeper marks lapsed holds `EXPIRED` (a booking whose visits are all expired shows as `EXPIRED`). It runs in the app every `HOLD_SWEEP_SECONDS`, is safe on several instances at once, and also deletes old idempotency keys.
+- **Paying late:** an expired visit can still be paid, but only while the slot is free. Under the maid lock, every visit being paid is re-checked before anything is charged. If someone else has the slot the answer is `409 HOLD_EXPIRED` and nothing is charged; if it is free the hold is renewed and the payment goes through. A visit whose time has passed cannot be paid.
+- Expired visits cannot be cancelled and do not count as upcoming for removing a maid.
+- The UI shows a countdown in the payment sheet and on the booking, an Expired state, and "Pay (we re-check the slot)".
+- **Upgrading:** unpaid visits written by the previous release have no deadline, so they count as already lapsed: they stop blocking the maid, get swept, and can be paid again if the slot is free. Paid visits are untouched.
+
+**Payment idempotency.** `Idempotency-Key` is scoped to the booking and checked under the maid lock.
+
+| Case | Result |
+|---|---|
+| Same key, same request | the first result is returned, nothing is charged again |
+| Same key, different request (method, instrument or visit) | `422 IDEMPOTENCY_KEY_REUSED` |
+| Same key while an earlier attempt never finished (for example a crash after charging) | `409 IDEMPOTENCY_IN_PROGRESS`, with no new charge; check the booking first |
+| A failed attempt (declined payment, expired hold, nothing to pay) | the key is released, so a corrected retry can reuse it |
+| Key older than `IDEMPOTENCY_HOURS` | forgotten and purged by the sweeper |
+
+The request fingerprint is a SHA-256 of method, instrument and visit, so the store never keeps the instrument itself. In production the instrument would already be a gateway token, never a card number. Keys written by the previous release have no fingerprint or expiry and are retired at upgrade.
 
 ## Scaling notes
 
@@ -51,7 +74,7 @@ The old no-slot search also returned every match (about 500) instead of a page, 
 **Still to do**
 
 - A Postgres exclusion constraint on a maid's overlapping active occurrences, with a migration, as a second guard behind the advisory lock.
-- Move the payment gateway call out of the maid lock, and add hold expiry for unpaid bookings.
+- Move the payment gateway call out of the maid lock.
 - Move side effects (notifications, invoices) behind an outbox with workers.
 - Shard or partition by city or maid. A booking only competes with other bookings for the same maid, so one maid's requests can go to one worker.
 - Cache availability only as a hint with a short TTL and re-check in the database when booking; never validate on a read replica.
@@ -64,7 +87,10 @@ The old no-slot search also returned every match (about 500) instead of a page, 
 |---|---|
 | `DATABASE_URL` | Postgres connection string. Unset = in-memory. `postgres://` and `postgresql://` are both accepted. Tables are created on startup. |
 | `APP_TIMEZONE` | Business timezone for "now" and availability windows (default `Asia/Kolkata`; servers on Render run UTC). |
-| `TEST_DATABASE_URL` | Enables the Postgres runs of the test suite (the service tests run on both backends: 84 tests). |
+| `HOLD_MINUTES` | How long an unpaid booking holds the maid's slot (default 10). |
+| `HOLD_SWEEP_SECONDS` | How often expired holds are swept (default 30, 0 turns the sweeper off). |
+| `IDEMPOTENCY_HOURS` | How long a payment `Idempotency-Key` is remembered (default 24). |
+| `TEST_DATABASE_URL` | Enables the Postgres runs of the test suite (the service tests run on both backends: 121 tests). |
 
 Run the same suite against Postgres: `TEST_DATABASE_URL=postgresql://user:pass@localhost/db python -m pytest`.
 

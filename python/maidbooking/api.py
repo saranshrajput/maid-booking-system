@@ -1,4 +1,8 @@
+import logging
 import os
+import threading
+from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from datetime import date, datetime, time
 from decimal import Decimal
@@ -15,21 +19,25 @@ from .booking_strategies import (BookingCommand, BookingStrategyRegistry, Instan
 from .cancellation_policy import TimeBasedCancellationPolicy
 from .domain import (AvailabilityWindow, Booking, BookingType, DayOfWeek, Gender, Maid, PaymentMethodType,
                      RecurrenceRule, ServiceType, TimeSlot)
-from .exceptions import (InvalidRequestError, InvalidStateError, MaidHasUpcomingBookingsError, NotFoundError,
-                         PaymentFailedError, SlotUnavailableError)
+from .exceptions import (HoldExpiredError, IdempotencyInProgressError, IdempotencyKeyReusedError, InvalidRequestError,
+                         InvalidStateError, MaidHasUpcomingBookingsError, NotFoundError, PaymentFailedError,
+                         SlotUnavailableError)
 from .payment_processors import (CardPaymentProcessor, PaymentProcessorRegistry, UpiPaymentProcessor,
                                  WalletPaymentProcessor)
 from .config import build_infrastructure, local_clock
 from .pricing import HourlyPricingStrategy
 from .search import MaidSearchCriteria, MaidSearchService
-from .services import (AvailabilityService, BookingService, CancellationService, MaidService,
-                       OnboardMaidCommand, PayCommand, PaymentService)
+from .services import (AvailabilityService, BookingService, CancellationService, HoldExpiryService, HoldPolicy,
+                       MaidService, OnboardMaidCommand, PayCommand, PaymentService)
 
 DEFAULT_SEARCH_DURATION_MINUTES = 60
 DEFAULT_PAGE_SIZE = 50
+log = logging.getLogger(__name__)
 MAX_PAGE_SIZE = 100
 STATIC_DIR = Path(__file__).parent / "static"
-ERROR_STATUS = {MaidHasUpcomingBookingsError: (409, "MAID_HAS_UPCOMING_BOOKINGS"), NotFoundError: (404, "NOT_FOUND"), InvalidRequestError: (400, "INVALID_REQUEST"),
+ERROR_STATUS = {HoldExpiredError: (409, "HOLD_EXPIRED"), IdempotencyInProgressError: (409, "IDEMPOTENCY_IN_PROGRESS"),
+                IdempotencyKeyReusedError: (422, "IDEMPOTENCY_KEY_REUSED"),
+                MaidHasUpcomingBookingsError: (409, "MAID_HAS_UPCOMING_BOOKINGS"), NotFoundError: (404, "NOT_FOUND"), InvalidRequestError: (400, "INVALID_REQUEST"),
                 SlotUnavailableError: (409, "SLOT_UNAVAILABLE"), InvalidStateError: (409, "INVALID_STATE"),
                 PaymentFailedError: (402, "PAYMENT_FAILED")}
 
@@ -84,26 +92,54 @@ def booking_json(b: Booking) -> dict:
     return {"id": b.id, "customerId": b.customer_id, "maidId": b.maid_id, "serviceType": b.service_type,
             "bookingType": b.booking_type, "status": b.status,
             "occurrences": [{"id": o.id, "start": o.slot.start, "end": o.slot.end, "price": float(o.price),
-                             "status": o.status} for o in b.occurrences]}
+                             "status": o.status, "holdExpiresAt": o.hold_expires_at} for o in b.occurrences]}
 
 
-def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Optional[str] = None) -> FastAPI:
+def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Optional[str] = None,
+               holds: Optional[HoldPolicy] = None, sweep_seconds: Optional[float] = None) -> FastAPI:
+    """HOLD_MINUTES (default 10) is how long an unpaid booking holds the slot, IDEMPOTENCY_HOURS (default 24) how long
+    a payment key is remembered, HOLD_SWEEP_SECONDS (default 30, 0 = off) how often expired holds are swept."""
     clock = clock or local_clock()
+    holds = holds or HoldPolicy(timedelta(minutes=float(os.getenv("HOLD_MINUTES", "10"))),
+                                timedelta(hours=float(os.getenv("IDEMPOTENCY_HOURS", "24"))))
+    sweep_seconds = float(os.getenv("HOLD_SWEEP_SECONDS", "30")) if sweep_seconds is None else sweep_seconds
     infra = build_infrastructure(database_url)
     maid_repo, booking_repo, payment_repo, locks = infra.maids, infra.bookings, infra.payments, infra.locks
     processors = PaymentProcessorRegistry([CardPaymentProcessor(), UpiPaymentProcessor(), WalletPaymentProcessor()])
-    availability = AvailabilityService(booking_repo)
+    availability = AvailabilityService(booking_repo, clock)
     maid_service = MaidService(maid_repo, booking_repo, clock)
     search_service = MaidSearchService(maid_repo, availability)
     booking_service = BookingService(
         maid_service, booking_repo,
         BookingStrategyRegistry([InstantBookingStrategy(), ScheduledBookingStrategy(), RecurringBookingStrategy()]),
-        availability, HourlyPricingStrategy(), locks, clock)
-    payment_service = PaymentService(booking_repo, payment_repo, infra.idempotency, processors, locks)
+        availability, HourlyPricingStrategy(), locks, clock, holds)
+    payment_service = PaymentService(booking_repo, payment_repo, infra.idempotency, processors, locks, maid_service,
+                                     availability, clock, holds)
+    hold_expiry = HoldExpiryService(booking_repo, infra.idempotency, locks, clock)
     cancellation_service = CancellationService(booking_repo, payment_repo, processors,
                                                TimeBasedCancellationPolicy(), locks, clock)
 
-    app = FastAPI(title="Maid Booking System")
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        stop = threading.Event()
+
+        def sweep_loop():
+            while True:
+                try:
+                    hold_expiry.sweep()
+                except Exception:
+                    log.exception("hold expiry sweep failed")
+                if stop.wait(sweep_seconds):
+                    return
+
+        worker = threading.Thread(target=sweep_loop, name="hold-expiry", daemon=True)
+        if sweep_seconds > 0:
+            worker.start()
+        yield
+        stop.set()
+
+    app = FastAPI(title="Maid Booking System", lifespan=lifespan)
+    app.state.hold_expiry = hold_expiry  # tests and ops can run a sweep by hand
 
     @app.exception_handler(InvalidRequestError)
     @app.exception_handler(NotFoundError)

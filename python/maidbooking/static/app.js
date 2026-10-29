@@ -163,19 +163,21 @@ function armedButton(text, armedText, action, extra) {
 // The API only knows pending / confirmed / cancelled; what is upcoming, running or finished depends on the clock.
 function occState(o, now) {
   if (o.status === "CANCELLED") return "cancelled";
-  if (o.status === "PENDING_PAYMENT") return "pending";
+  // An unpaid hold that has run out counts as expired even before the server's sweeper has marked it.
+  if (o.status === "EXPIRED") return "expired";
+  if (o.status === "PENDING_PAYMENT") return o.holdExpiresAt && parseLocal(o.holdExpiresAt) > now ? "pending" : "expired";
   const start = parseLocal(o.start), end = parseLocal(o.end);
   if (end <= now) return "completed";
   if (start <= now) return "inprogress";
   return "upcoming";
 }
-const STATE_LABEL = { upcoming: "Upcoming", completed: "Completed", inprogress: "In progress", cancelled: "Cancelled", pending: "Awaiting payment" };
+const STATE_LABEL = { upcoming: "Upcoming", completed: "Completed", inprogress: "In progress", cancelled: "Cancelled", pending: "Awaiting payment", expired: "Expired" };
 const pill = (s) => el("span", { class: `pill ${s}` }, STATE_LABEL[s]);
 
 function bookingState(b, now) {
   const states = b.occurrences.map((o) => occState(o, now));
   for (const s of ["inprogress", "pending", "upcoming", "completed"]) if (states.includes(s)) return s;
-  return "cancelled";
+  return states.every((s) => s === "expired") ? "expired" : "cancelled";
 }
 function bookingKind(b) {
   if (b.bookingType !== "RECURRING") return "single";
@@ -184,7 +186,12 @@ function bookingKind(b) {
   return days.length > 1 && consecutive ? "multiple" : "recurring";
 }
 const sortedOccs = (b) => [...b.occurrences].sort((x, y) => parseLocal(x.start) - parseLocal(y.start));
-const activeTotal = (b) => b.occurrences.filter((o) => o.status !== "CANCELLED").reduce((s, o) => s + Number(o.price), 0);
+const activeTotal = (b, now = serverNow()) => b.occurrences.filter((o) => !["cancelled", "expired"].includes(occState(o, now))).reduce((s, o) => s + Number(o.price), 0);
+
+// Visits that can still be paid: unpaid or expired, and not yet over. Paying an expired one re-checks the slot first.
+const isPayable = (o, now) => (o.status === "PENDING_PAYMENT" || o.status === "EXPIRED") && parseLocal(o.end) > now;
+const holdLeft = (o, now) => (o.status === "PENDING_PAYMENT" && o.holdExpiresAt ? Math.max(0, Math.floor((parseLocal(o.holdExpiresAt) - now) / 1000)) : 0);
+const clockText = (seconds) => `${Math.floor(seconds / 60)}:${pad(seconds % 60)}`;
 
 /* ===================== routing ===================== */
 
@@ -228,7 +235,8 @@ const dlg = document.getElementById("dlg");
 document.getElementById("dlg-close").addEventListener("click", () => dlg.close());
 dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
 let sheetHash = "";
-dlg.addEventListener("close", () => { if (location.hash === sheetHash && /^#\/(booking|bookings)/.test(location.hash)) route(); });
+let sheetTimer = null;
+dlg.addEventListener("close", () => { clearInterval(sheetTimer); if (location.hash === sheetHash && /^#\/(booking|bookings)/.test(location.hash)) route(); });
 function showSheet(title, ...content) {
   if (!dlg.open) sheetHash = location.hash;
   document.getElementById("dlg-title").textContent = title;
@@ -575,7 +583,7 @@ async function reserve(maid, button) {
 
 async function openPayment(booking, preferredOccurrenceId) {
   const maid = await getMaid(booking.maidId).catch(() => null);
-  const unpaid = sortedOccs(booking).filter((o) => o.status === "PENDING_PAYMENT");
+  const unpaid = sortedOccs(booking).filter((o) => isPayable(o, serverNow()));
   const maidName = maid ? maid.name : "your maid";
   if (!unpaid.length) { toast("Nothing left to pay on this booking"); return; }
 
@@ -600,6 +608,19 @@ async function openPayment(booking, preferredOccurrenceId) {
     : el("div", null, el("input", { type: "radio", name: "scope", value: "ONE", checked: true, hidden: true }),
       el("select", { id: "p-occ", hidden: true }, el("option", { value: unpaid[0].id }, unpaid[0].id)));
 
+  // Countdown to the earliest hold; once it ends the sheet says that paying now re-checks the slot.
+  const holdNote = el("div", { class: "note", id: "hold-timer", "aria-live": "off" });
+  const paintHold = () => {
+    const secs = Math.min(...unpaid.map((o) => (o.status === "PENDING_PAYMENT" ? holdLeft(o, serverNow()) : 0)));
+    const lapsed = secs === 0;
+    holdNote.classList.toggle("warn", lapsed);
+    holdNote.textContent = lapsed ? "The hold on this slot has ended. If you pay now, we first check that it is still free."
+      : `Your slot is held for ${clockText(secs)}. Pay before then to keep it.`;
+  };
+  paintHold();
+  clearInterval(sheetTimer);
+  sheetTimer = setInterval(paintHold, 1000);
+
   const method = select("p-method", Object.entries(METHODS).map(([k, v]) => [k, v.label]), "UPI");
   const instrument = el("input", { id: "p-instrument", type: "text", autocomplete: "off", spellcheck: "false", required: true });
   const hint = el("span", { class: "hint", id: "p-hint" });
@@ -610,6 +631,7 @@ async function openPayment(booking, preferredOccurrenceId) {
       el("div", { class: "row" }, el("b", null, `${SERVICE_TITLES[booking.serviceType]} with ${maidName}`), pill(bookingState(booking, serverNow()))),
       sortedOccs(booking).map((o) => el("div", { class: "row" }, el("span", null, `${fmtDay(parseLocal(o.start))}, ${fmtClock(parseLocal(o.start))}`),
         el("span", null, `${moneyExact(o.price)} · ${STATE_LABEL[occState(o, serverNow())]}`)))),
+    holdNote,
     scope,
     el("div", { class: "row2" }, field("Payment method", method), field("Payment details", instrument)),
     hint, errorBox,
@@ -629,6 +651,9 @@ async function openPayment(booking, preferredOccurrenceId) {
       showPaid(await api(`/api/bookings/${booking.id}`), payments, maidName);
     } catch (err) {
       errorBox.append(el("div", { class: "note err", role: "alert" }, err.message));
+      if (err.code === "HOLD_EXPIRED") {
+        errorBox.append(el("a", { class: "btn block", id: "choose-another", href: `#/details/${booking.serviceType}`, style: "display:block;text-align:center;text-decoration:none;margin-top:10px", onclick: () => dlg.close() }, "Choose another time"));
+      }
       payBtn.disabled = false;
     }
   });
@@ -636,7 +661,7 @@ async function openPayment(booking, preferredOccurrenceId) {
 
 function showPaid(booking, payments, maidName) {
   const total = payments.reduce((s, p) => s + Number(p.amount), 0);
-  const left = booking.occurrences.filter((o) => o.status === "PENDING_PAYMENT").length;
+  const left = booking.occurrences.filter((o) => isPayable(o, serverNow())).length;
   showSheet("Payment received",
     el("div", { class: "done" }, el("div", { class: "tick", "aria-hidden": "true" }, "✓"),
       el("h3", { id: "paid-title" }, left ? "Visit paid" : "Booking confirmed"),
@@ -678,8 +703,8 @@ function bookingCard(b) {
   const now = serverNow(), occs = sortedOccs(b), kind = bookingKind(b), maid = state.maids.get(b.maidId);
   const first = parseLocal(occs[0].start), lastDay = parseLocal(occs[occs.length - 1].start), multi = occs.length > 1;
   const mins = minutesBetween(first, parseLocal(occs[0].end));
-  const pending = occs.filter((o) => o.status === "PENDING_PAYMENT").reduce((s, o) => s + Number(o.price), 0), total = activeTotal(b);
-  const amount = !total ? "Cancelled" : pending ? `Amount: ${moneyExact(total)} (${pending === total ? "Pending" : `${moneyExact(pending)} pending`})` : `Amount: ${moneyExact(total)} (Paid online)`;
+  const pending = occs.filter((o) => occState(o, now) === "pending").reduce((s, o) => s + Number(o.price), 0), total = activeTotal(b);
+  const amount = !total ? (bookingState(b, now) === "expired" ? "Not paid in time" : "Cancelled") : pending ? `Amount: ${moneyExact(total)} (${pending === total ? "Pending" : `${moneyExact(pending)} pending`})` : `Amount: ${moneyExact(total)} (Paid online)`;
   const title = multi ? `${fmtDay(first)} - ${fmtDay(lastDay)}` : fmtDay(first);
   const sub = `${fmtClock(first)} · ${mins} mins · ${multi ? (kind === "multiple" ? `${occs.length} days` : `${occs.length} visits`) : DAYS[wdIndex(first)]}`;
   const card = el("article", { class: "bk", "data-booking": b.id, "data-kind": kind });
@@ -714,7 +739,15 @@ async function renderBookingDetails(view, id, occId) {
   const now = serverNow(), occs = sortedOccs(b);
   const pick = occs.find((o) => o.id === occId) || occs.find((o) => ["inprogress", "pending", "upcoming"].includes(occState(o, now))) || occs[occs.length - 1];
   const s = occState(pick, now), start = parseLocal(pick.start), end = parseLocal(pick.end);
-  const headline = { upcoming: "Upcoming service", inprogress: "Service in progress", completed: "Service completed", pending: "Payment pending", cancelled: "Booking cancelled" }[s];
+  const headline = { upcoming: "Upcoming service", inprogress: "Service in progress", completed: "Service completed", pending: "Payment pending", cancelled: "Booking cancelled", expired: "Hold expired" }[s];
+  const holdLine = el("p", { id: "hold-line", style: "margin:4px 0 0;opacity:.9;font-size:14px" });
+  const paintHold = () => {
+    if (s === "pending") holdLine.textContent = `Pay within ${clockText(holdLeft(pick, serverNow()))} to keep this slot`;
+    else if (s === "expired" && isPayable(pick, serverNow())) holdLine.textContent = "You did not pay in time. You can still pay if the slot is free.";
+    else if (s === "expired") holdLine.textContent = "You did not pay in time.";
+  };
+  paintHold();
+  if (s === "pending") state.timers.push(setInterval(() => { paintHold(); if (holdLeft(pick, serverNow()) === 0) route(); }, 1000));
   const ring = el("div", { class: "ring", id: "ring" });
   const paintRing = () => {
     if (s !== "inprogress") { ring.replaceChildren(); return; }
@@ -725,11 +758,12 @@ async function renderBookingDetails(view, id, occId) {
   paintRing();
   if (s === "inprogress") state.timers.push(setInterval(paintRing, 15000));
 
-  const unpaid = occs.filter((o) => o.status === "PENDING_PAYMENT");
-  const active = occs.filter((o) => o.status !== "CANCELLED");
+  const unpaid = occs.filter((o) => isPayable(o, now));
+  const active = occs.filter((o) => !["cancelled", "expired"].includes(occState(o, now)));
+  const canPay = isPayable(pick, now);
   const after = () => route();
   view.append(...[topbar("Booking details", { back: () => go("#/bookings") }),
-    el("div", { class: `statusbar ${s}`, id: "statusbar" }, el("h1", { id: "status-title" }, headline), ring),
+    el("div", { class: `statusbar ${s}`, id: "statusbar" }, el("div", null, el("h1", { id: "status-title" }, headline), holdLine), ring),
     el("div", { class: "card pull" },
       el("div", { class: "maid-top" }, el("div", { class: "avatar", "aria-hidden": "true" }, (maid ? maid.name : "?").charAt(0).toUpperCase()),
         el("div", null, el("h3", { id: "d-maid" }, maid ? maid.name : "Your maid"), el("div", { class: "sub" }, `${SERVICE_TITLES[b.serviceType]}${maid ? ` · ★ ${Number(maid.rating).toFixed(1)}` : ""}`)), pill(s))),
@@ -740,7 +774,7 @@ async function renderBookingDetails(view, id, occId) {
     el("div", { class: "card" }, el("h3", null, "Service area"), el("p", { class: "sub" }, maid ? maid.locality : "")),
     el("div", { class: "card" }, el("h3", null, "Payment details"),
       el("div", { class: "kv" }, el("div", { class: "total" }, el("span", null, "Total payable"), el("span", { id: "d-total" }, moneyExact(pick.price))),
-        el("div", null, el("span", null, "Payment status"), el("span", { id: "d-paystatus" }, pick.status === "PENDING_PAYMENT" ? "Pending" : pick.status === "CONFIRMED" ? "Paid online" : "Cancelled")),
+        el("div", null, el("span", null, "Payment status"), el("span", { id: "d-paystatus" }, { pending: "Pending", expired: "Not paid in time", cancelled: "Cancelled" }[s] || "Paid online")),
         occs.length > 1 ? el("div", null, el("span", null, "Whole booking"), el("span", null, moneyExact(activeTotal(b)))) : null)),
     occs.length > 1 ? el("div", { class: "card" }, el("h3", null, "Multiple visits"),
       el("div", { class: "dots" }, occs.map((o) => el("button", { class: `dot ${occState(o, now)}`, type: "button", "data-occ": o.id, "aria-pressed": String(o.id === pick.id),
@@ -748,9 +782,9 @@ async function renderBookingDetails(view, id, occId) {
     el("div", { class: "card" }, el("h3", null, "Cancellation policy"),
       el("p", { class: "sub" }, "Full refund when you cancel 24 hours or more before the visit, 50% from 2 to 24 hours, none after that.")),
     el("div", { class: "actions", id: "detail-actions" },
-      pick.status === "PENDING_PAYMENT" ? el("button", { class: "btn primary", type: "button", id: "pay-visit", onclick: () => openPayment(b, pick.id) }, `Pay ${moneyExact(pick.price)}`) : null,
+      canPay ? el("button", { class: "btn primary", type: "button", id: "pay-visit", onclick: () => openPayment(b, pick.id) }, s === "expired" ? `Pay ${moneyExact(pick.price)} (we re-check the slot)` : `Pay ${moneyExact(pick.price)}`) : null,
       unpaid.length > 1 ? el("button", { class: "btn primary", type: "button", id: "pay-all", onclick: () => openPayment(b) }, `Pay all ${unpaid.length} unpaid visits`) : null,
-      pick.status !== "CANCELLED" && s !== "completed" ? armedButton(occs.length > 1 ? "Cancel this visit" : "Cancel booking", "Confirm cancel", () => cancelBooking(b.id, pick.id, after), "visit") : null,
+      !["cancelled", "expired", "completed"].includes(s) ? armedButton(occs.length > 1 ? "Cancel this visit" : "Cancel booking", "Confirm cancel", () => cancelBooking(b.id, pick.id, after), "visit") : null,
       active.length > 1 ? armedButton("Cancel whole series", "Confirm cancel series", () => cancelBooking(b.id, null, after), "series") : null)].filter(Boolean));
 }
 
