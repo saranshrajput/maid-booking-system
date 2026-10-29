@@ -2,9 +2,37 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 from typing import Optional
 
-from .domain import Booking, Maid, Payment
+from .domain import Booking, Gender, Maid, Payment, ServiceType, TimeSlot
+
+
+@dataclass(frozen=True)
+class MaidQuery:
+    """The search attributes a repository can filter on itself, so a database can use indexes and paginate."""
+    locality: Optional[str] = None
+    service_type: Optional[ServiceType] = None
+    gender: Optional[Gender] = None
+    min_rating: Optional[float] = None
+    max_hourly_rate: Optional[Decimal] = None
+
+    # With a service type the cap applies to that service's rate, otherwise to any offered rate.
+    def matches(self, m: Maid) -> bool:
+        if self.locality and not m.serves_locality(self.locality):
+            return False
+        if self.gender and m.gender != self.gender:
+            return False
+        if self.min_rating is not None and m.rating < self.min_rating:
+            return False
+        if self.service_type and not m.offers(self.service_type):
+            return False
+        if self.max_hourly_rate is not None:
+            rates = [m.hourly_rates[self.service_type]] if self.service_type else m.hourly_rates.values()
+            return any(r <= self.max_hourly_rate for r in rates)
+        return True
 
 
 class MaidRepository(ABC):
@@ -15,7 +43,18 @@ class MaidRepository(ABC):
     def find_by_id(self, id: str) -> Optional[Maid]: ...
 
     @abstractmethod
-    def find_all(self) -> list[Maid]: ...
+    def search(self, query: MaidQuery, limit: Optional[int] = None, offset: int = 0) -> list[Maid]:
+        """Maids matching the query, best rated first then by name."""
+
+    @abstractmethod
+    def count(self, query: MaidQuery) -> int: ...
+
+    @abstractmethod
+    def localities(self) -> list[str]: ...
+
+    @abstractmethod
+    def service_summary(self, locality: Optional[str]) -> dict[ServiceType, tuple[int, Decimal]]:
+        """Per service: how many maids offer it and the lowest hourly rate, optionally within one area."""
 
 
 class BookingRepository(ABC):
@@ -27,6 +66,10 @@ class BookingRepository(ABC):
 
     @abstractmethod
     def find_by_maid_id(self, maid_id: str) -> list[Booking]: ...
+
+    @abstractmethod
+    def find_busy_slots(self, maid_ids: list[str], window: TimeSlot) -> dict[str, list[TimeSlot]]:
+        """Active (not cancelled) occurrence slots overlapping `window`, for many maids in one call."""
 
     @abstractmethod
     def find_by_customer_id(self, customer_id: str) -> list[Booking]: ...
@@ -64,9 +107,31 @@ class InMemoryMaidRepository(MaidRepository):
     def find_by_id(self, id):
         return self._store.get(id)
 
-    def find_all(self):
+    def search(self, query, limit=None, offset=0):
         with self._lock:
-            return list(self._store.values())
+            matches = [m for m in self._store.values() if query.matches(m)]
+        matches.sort(key=lambda m: (-m.rating, m.name))
+        return matches[offset:offset + limit] if limit else matches[offset:]
+
+    def count(self, query):
+        with self._lock:
+            return sum(1 for m in self._store.values() if query.matches(m))
+
+    def localities(self):
+        with self._lock:
+            return sorted({m.locality for m in self._store.values()})
+
+    def service_summary(self, locality):
+        summary: dict = {}
+        with self._lock:
+            maids = list(self._store.values())
+        for m in maids:
+            if locality and not m.serves_locality(locality):
+                continue
+            for service, rate in m.hourly_rates.items():
+                count, lowest = summary.get(service, (0, rate))
+                summary[service] = (count + 1, min(lowest, rate))
+        return summary
 
 
 class InMemoryBookingRepository(BookingRepository):
@@ -89,6 +154,17 @@ class InMemoryBookingRepository(BookingRepository):
     def find_by_customer_id(self, customer_id):
         with self._lock:
             return [b for b in self._store.values() if b.customer_id == customer_id]
+
+    def find_busy_slots(self, maid_ids, window):
+        wanted = set(maid_ids)
+        with self._lock:
+            bookings = [b for b in self._store.values() if b.maid_id in wanted]
+        busy: dict = {}
+        for b in bookings:
+            for o in b.occurrences:
+                if o.is_active and o.slot.overlaps(window):
+                    busy.setdefault(b.maid_id, []).append(o.slot)
+        return busy
 
 
 class InMemoryPaymentRepository(PaymentRepository):

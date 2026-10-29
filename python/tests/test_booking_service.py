@@ -110,3 +110,18 @@ def test_two_app_instances_sharing_a_database_cannot_double_book():
 
     assert results.count(True) == 1
     assert len(instance_a.booking_repo.find_by_maid_id(maid.id)) == 1
+
+
+def test_busy_slots_report_only_active_overlapping_slots(ctx, maid):
+    from maidbooking.domain import TimeSlot
+    booking = ctx.book_scheduled(maid, TOMORROW_10, 60)
+    other = ctx.maid("Other", "Koramangala")
+    day = TimeSlot(datetime(2030, 1, 8, 0, 0), datetime(2030, 1, 9, 0, 0))
+
+    busy = ctx.booking_repo.find_busy_slots([maid.id, other.id], day)
+    assert busy == {maid.id: [booking.occurrences[0].slot]}
+    assert ctx.booking_repo.find_busy_slots([maid.id], TimeSlot(datetime(2030, 1, 8, 11, 0), datetime(2030, 1, 8, 12, 0))) == {}
+    assert ctx.booking_repo.find_busy_slots([], day) == {}
+
+    ctx.cancellations.cancel(booking.id)
+    assert ctx.booking_repo.find_busy_slots([maid.id], day) == {}
