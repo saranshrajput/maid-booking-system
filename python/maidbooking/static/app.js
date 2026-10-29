@@ -192,7 +192,19 @@ const TAB_SCREENS = new Set(["home", "bookings", "account"]);
 
 function clearTimers() { state.timers.forEach(clearInterval); state.timers = []; }
 
+// Only one screen render runs at a time. Two overlapping renders (a hash change plus a sheet closing) would both
+// append to the same page once their requests came back, drawing the screen twice. A request that arrives while
+// one is running is remembered and rendered once afterwards, against the then-current hash.
+let routeRunning = false;
+let routeQueued = null;
 async function route(opts = {}) {
+  if (routeRunning) { routeQueued = opts; return; }
+  routeRunning = true;
+  try { await renderRoute(opts); } finally { routeRunning = false; }
+  if (routeQueued) { const next = routeQueued; routeQueued = null; route(next); }
+}
+
+async function renderRoute(opts) {
   clearTimers();
   const [name, a, b] = (location.hash || "#/home").replace(/^#\/?/, "").split("/");
   const screen = routes[name] ? name : "home";
@@ -214,8 +226,10 @@ const go = (hash) => { location.hash = hash; };
 const dlg = document.getElementById("dlg");
 document.getElementById("dlg-close").addEventListener("click", () => dlg.close());
 dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
-dlg.addEventListener("close", () => { if (/^#\/(booking|bookings)/.test(location.hash)) route(); });
+let sheetHash = "";
+dlg.addEventListener("close", () => { if (location.hash === sheetHash && /^#\/(booking|bookings)/.test(location.hash)) route(); });
 function showSheet(title, ...content) {
+  if (!dlg.open) sheetHash = location.hash;
   document.getElementById("dlg-title").textContent = title;
   document.getElementById("dlg-body").replaceChildren(...content);
   if (!dlg.open) dlg.showModal();

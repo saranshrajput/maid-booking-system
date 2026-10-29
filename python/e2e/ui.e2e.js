@@ -106,10 +106,15 @@ async function payWith(method, instrument) {
   await page.click('#p-submit');
   await page.waitForSelector('#paid-title');
   check((await text('#paid-title')) === 'Booking confirmed', 'successful payment confirms the booking');
+  // A slow network used to draw the details screen twice (the link and the closing sheet both re-rendered it).
+  await page.route('**/api/**', async (route) => { await new Promise((r) => setTimeout(r, 300)); await route.continue(); });
   await page.click('#view-booking');
 
   // 4. Booking details, then cancel with refund
   await page.waitForSelector('#status-title');
+  await page.waitForTimeout(1500);
+  check((await page.locator('.statusbar').count()) === 1 && (await page.locator('.topbar').count()) === 1, 'booking details are drawn once even on a slow network');
+  await page.unroute('**/api/**');
   check((await text('#status-title')) === 'Upcoming service', 'booking details show an upcoming service');
   check(!/null|undefined/.test(await text('#view')), 'booking details show no stray null or undefined text');
   check((await text('#d-start')) === '10:00 am' && (await text('#d-total')) === '₹250.00' && (await text('#d-paystatus')) === 'Paid online', 'details show time, amount and paid status');
