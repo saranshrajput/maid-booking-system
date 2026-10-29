@@ -28,6 +28,9 @@ class BookingRepository(ABC):
     @abstractmethod
     def find_by_maid_id(self, maid_id: str) -> list[Booking]: ...
 
+    @abstractmethod
+    def find_by_customer_id(self, customer_id: str) -> list[Booking]: ...
+
 
 class PaymentRepository(ABC):
     @abstractmethod
@@ -82,6 +85,10 @@ class InMemoryBookingRepository(BookingRepository):
     def find_by_maid_id(self, maid_id):
         with self._lock:
             return [b for b in self._store.values() if b.maid_id == maid_id]
+
+    def find_by_customer_id(self, customer_id):
+        with self._lock:
+            return [b for b in self._store.values() if b.customer_id == customer_id]
 
 
 class InMemoryPaymentRepository(PaymentRepository):

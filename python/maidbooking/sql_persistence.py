@@ -45,7 +45,7 @@ class OccurrenceRow(Base):
 class BookingRow(Base):
     __tablename__ = "bookings"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    customer_id: Mapped[str] = mapped_column(String(100))
+    customer_id: Mapped[str] = mapped_column(String(100), index=True)
     maid_id: Mapped[str] = mapped_column(String(36), index=True)
     service_type: Mapped[str] = mapped_column(String(30))
     booking_type: Mapped[str] = mapped_column(String(20))
@@ -135,6 +135,11 @@ class SqlBookingRepository(BookingRepository):
     def find_by_maid_id(self, maid_id: str) -> list[Booking]:
         with self._sessions() as s:
             rows = s.scalars(select(BookingRow).where(BookingRow.maid_id == maid_id))
+            return [self._to_domain(r) for r in rows]
+
+    def find_by_customer_id(self, customer_id: str) -> list[Booking]:
+        with self._sessions() as s:
+            rows = s.scalars(select(BookingRow).where(BookingRow.customer_id == customer_id))
             return [self._to_domain(r) for r in rows]
 
     @staticmethod
