@@ -6,13 +6,14 @@ from datetime import datetime, time
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import JSON, DateTime, Float, ForeignKey, Numeric, String, create_engine, select, text
+from sqlalchemy import (JSON, DateTime, Float, ForeignKey, Index, Numeric, String, create_engine, delete, distinct, func,
+                        select, text)
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, selectinload, sessionmaker
 
 from .domain import (AvailabilityWindow, Booking, BookingOccurrence, BookingType, DayOfWeek, Gender, Maid,
                      OccurrenceStatus, Payment, PaymentMethodType, PaymentStatus, ServiceType, TimeSlot)
-from .repositories import BookingRepository, IdempotencyStore, MaidRepository, PaymentRepository
+from .repositories import BookingRepository, IdempotencyStore, MaidQuery, MaidRepository, PaymentRepository
 from .services import LockManager, MaidLockManager
 
 
@@ -32,11 +33,20 @@ class MaidRow(Base):
     availability: Mapped[list] = mapped_column(JSON)
 
 
+class MaidServiceRow(Base):
+    """One row per (maid, service) so searches can filter and aggregate by service and rate with an index."""
+    __tablename__ = "maid_services"
+    maid_id: Mapped[str] = mapped_column(ForeignKey("maids.id"), primary_key=True)
+    service_type: Mapped[str] = mapped_column(String(30), primary_key=True)
+    hourly_rate: Mapped[Decimal] = mapped_column(Numeric(10, 2))
+    __table_args__ = (Index("ix_maid_services_type_rate", "service_type", "hourly_rate"),)
+
+
 class OccurrenceRow(Base):
     __tablename__ = "booking_occurrences"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     booking_id: Mapped[str] = mapped_column(ForeignKey("bookings.id"), index=True)
-    start_at: Mapped[datetime] = mapped_column(DateTime)
+    start_at: Mapped[datetime] = mapped_column(DateTime, index=True)
     end_at: Mapped[datetime] = mapped_column(DateTime)
     price: Mapped[Decimal] = mapped_column(Numeric(12, 2))
     status: Mapped[str] = mapped_column(String(20))
@@ -66,6 +76,11 @@ class PaymentRow(Base):
     refunded_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=Decimal("0"))
 
 
+# Case-insensitive area lookups use this index (queries compare lower(locality)).
+Index("ix_maids_locality_lower", func.lower(MaidRow.locality))
+Index("ix_maids_rating", MaidRow.rating)
+
+
 class IdempotencyRow(Base):
     __tablename__ = "idempotency_keys"
     key: Mapped[str] = mapped_column(String(200), primary_key=True)
@@ -84,6 +99,11 @@ def create_db_engine(url: str) -> Engine:
     return create_engine(normalize_url(url), pool_size=10, max_overflow=10, pool_pre_ping=True)
 
 
+def _service_rows(maid_id: str, rates: dict) -> list[MaidServiceRow]:
+    return [MaidServiceRow(maid_id=maid_id, service_type=str(getattr(k, "value", k)), hourly_rate=Decimal(str(v)))
+            for k, v in rates.items()]
+
+
 class SqlMaidRepository(MaidRepository):
     def __init__(self, engine: Engine):
         self._sessions = sessionmaker(engine, expire_on_commit=False)
@@ -95,6 +115,9 @@ class SqlMaidRepository(MaidRepository):
                 hourly_rates={k.value: str(v) for k, v in maid.hourly_rates.items()}, skills=sorted(maid.skills),
                 availability=[{"day": int(w.day), "start": w.start.isoformat(), "end": w.end.isoformat()}
                               for w in maid.availability]))
+            s.flush()
+            s.execute(delete(MaidServiceRow).where(MaidServiceRow.maid_id == maid.id))
+            s.add_all(_service_rows(maid.id, maid.hourly_rates))
         return maid
 
     def find_by_id(self, id: str) -> Optional[Maid]:
@@ -102,9 +125,49 @@ class SqlMaidRepository(MaidRepository):
             row = s.get(MaidRow, id)
             return self._to_domain(row) if row else None
 
-    def find_all(self) -> list[Maid]:
+    @staticmethod
+    def _filtered(q: MaidQuery):
+        stmt = select(MaidRow)
+        if q.locality:
+            stmt = stmt.where(func.lower(MaidRow.locality) == q.locality.strip().lower())
+        if q.gender:
+            stmt = stmt.where(MaidRow.gender == q.gender.value)
+        if q.min_rating is not None:
+            stmt = stmt.where(MaidRow.rating >= q.min_rating)
+        if q.service_type or q.max_hourly_rate is not None:
+            offered = select(MaidServiceRow.maid_id)
+            if q.service_type:
+                offered = offered.where(MaidServiceRow.service_type == q.service_type.value)
+            if q.max_hourly_rate is not None:
+                offered = offered.where(MaidServiceRow.hourly_rate <= q.max_hourly_rate)
+            stmt = stmt.where(MaidRow.id.in_(offered))
+        return stmt
+
+    def search(self, query: MaidQuery, limit: Optional[int] = None, offset: int = 0) -> list[Maid]:
+        stmt = self._filtered(query).order_by(MaidRow.rating.desc(), MaidRow.name)
+        if limit:
+            stmt = stmt.limit(limit)
+        if offset:
+            stmt = stmt.offset(offset)
         with self._sessions() as s:
-            return [self._to_domain(r) for r in s.scalars(select(MaidRow))]
+            return [self._to_domain(r) for r in s.scalars(stmt)]
+
+    def count(self, query: MaidQuery) -> int:
+        with self._sessions() as s:
+            return s.scalar(select(func.count()).select_from(self._filtered(query).subquery())) or 0
+
+    def localities(self) -> list[str]:
+        with self._sessions() as s:
+            return list(s.scalars(select(distinct(MaidRow.locality)).order_by(MaidRow.locality)))
+
+    def service_summary(self, locality: Optional[str]) -> dict:
+        stmt = select(MaidServiceRow.service_type, func.count(), func.min(MaidServiceRow.hourly_rate)).group_by(
+            MaidServiceRow.service_type)
+        if locality and locality.strip():
+            stmt = stmt.join(MaidRow, MaidRow.id == MaidServiceRow.maid_id).where(
+                func.lower(MaidRow.locality) == locality.strip().lower())
+        with self._sessions() as s:
+            return {ServiceType(t): (n, Decimal(rate)) for t, n, rate in s.execute(stmt)}
 
     @staticmethod
     def _to_domain(r: MaidRow) -> Maid:
@@ -136,6 +199,19 @@ class SqlBookingRepository(BookingRepository):
         with self._sessions() as s:
             rows = s.scalars(select(BookingRow).where(BookingRow.maid_id == maid_id))
             return [self._to_domain(r) for r in rows]
+
+    def find_busy_slots(self, maid_ids: list[str], window: TimeSlot) -> dict:
+        if not maid_ids:
+            return {}
+        stmt = (select(BookingRow.maid_id, OccurrenceRow.start_at, OccurrenceRow.end_at)
+                .join(OccurrenceRow, OccurrenceRow.booking_id == BookingRow.id)
+                .where(BookingRow.maid_id.in_(maid_ids), OccurrenceRow.status != OccurrenceStatus.CANCELLED.value,
+                       OccurrenceRow.start_at < window.end, OccurrenceRow.end_at > window.start))
+        busy: dict = {}
+        with self._sessions() as s:
+            for maid_id, start, end in s.execute(stmt):
+                busy.setdefault(maid_id, []).append(TimeSlot(start, end))
+        return busy
 
     def find_by_customer_id(self, customer_id: str) -> list[Booking]:
         with self._sessions() as s:
@@ -227,3 +303,15 @@ class PostgresAdvisoryLockManager(LockManager):
 
 def create_schema(engine: Engine) -> None:
     Base.metadata.create_all(engine)
+    # create_all skips tables that already exist, so add any newer indexes to them explicitly.
+    for table in Base.metadata.sorted_tables:
+        for index in table.indexes:
+            index.create(engine, checkfirst=True)
+    backfill_service_rows(engine)
+
+
+def backfill_service_rows(engine: Engine) -> None:
+    """Maids saved before the maid_services table existed get their rows built from their stored rates."""
+    with sessionmaker(engine).begin() as s:
+        for row in s.scalars(select(MaidRow).where(~MaidRow.id.in_(select(MaidServiceRow.maid_id)))):
+            s.add_all(_service_rows(row.id, row.hourly_rates))

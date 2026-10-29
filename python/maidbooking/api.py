@@ -21,11 +21,13 @@ from .payment_processors import (CardPaymentProcessor, PaymentProcessorRegistry,
                                  WalletPaymentProcessor)
 from .config import build_infrastructure, local_clock
 from .pricing import HourlyPricingStrategy
-from .search import MaidSearchCriteria, MaidSearchService, standard_providers
+from .search import MaidSearchCriteria, MaidSearchService
 from .services import (AvailabilityService, BookingService, CancellationService, MaidService,
                        OnboardMaidCommand, PayCommand, PaymentService)
 
 DEFAULT_SEARCH_DURATION_MINUTES = 60
+DEFAULT_PAGE_SIZE = 50
+MAX_PAGE_SIZE = 100
 STATIC_DIR = Path(__file__).parent / "static"
 ERROR_STATUS = {NotFoundError: (404, "NOT_FOUND"), InvalidRequestError: (400, "INVALID_REQUEST"),
                 SlotUnavailableError: (409, "SLOT_UNAVAILABLE"), InvalidStateError: (409, "INVALID_STATE"),
@@ -92,7 +94,7 @@ def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Opt
     processors = PaymentProcessorRegistry([CardPaymentProcessor(), UpiPaymentProcessor(), WalletPaymentProcessor()])
     availability = AvailabilityService(booking_repo)
     maid_service = MaidService(maid_repo)
-    search_service = MaidSearchService(maid_repo, standard_providers(availability))
+    search_service = MaidSearchService(maid_repo, availability)
     booking_service = BookingService(
         maid_service, booking_repo,
         BookingStrategyRegistry([InstantBookingStrategy(), ScheduledBookingStrategy(), RecurringBookingStrategy()]),
@@ -147,15 +149,28 @@ def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Opt
         counts = availability.start_time_counts(maids, day, durationMinutes, not_before=clock())
         return [{"time": t.strftime("%H:%M"), "available": n} for t, n in counts]
 
+    @app.get("/api/localities")
+    def localities():
+        return maid_repo.localities()
+
+    @app.get("/api/services/summary")
+    def services_summary(locality: Optional[str] = None):
+        """Maid count and lowest hourly rate per service, computed in the database (one aggregate query)."""
+        return {service.value: {"maids": count, "minHourlyRate": float(rate)}
+                for service, (count, rate) in maid_repo.service_summary(locality).items()}
+
     @app.get("/api/maids/search")
-    def search(locality: Optional[str] = None, serviceType: Optional[ServiceType] = None,
+    def search(response: Response, locality: Optional[str] = None, serviceType: Optional[ServiceType] = None,
                date: Optional[date] = None, startTime: Optional[time] = None,
                durationMinutes: Optional[int] = None, minRating: Optional[float] = None,
                maxHourlyRate: Optional[Decimal] = None, gender: Optional[Gender] = None,
-               skills: Optional[list[str]] = Query(None)):
+               skills: Optional[list[str]] = Query(None), limit: int = Query(DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE),
+               offset: int = Query(0, ge=0)):
         slot = _requested_slot(date, startTime, durationMinutes)
         criteria = MaidSearchCriteria(locality, serviceType, slot, minRating, maxHourlyRate, gender, skills)
-        return [maid_json(m) for m in search_service.search(criteria)]
+        page = search_service.search_page(criteria, limit, offset)
+        response.headers["X-Total-Count"] = str(page.total)
+        return [maid_json(m) for m in page.items]
 
     @app.get("/api/maids/{maid_id}")
     def get_maid(maid_id: str):

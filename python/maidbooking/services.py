@@ -45,25 +45,26 @@ class AvailabilityService:
         self._bookings = bookings
 
     def is_available(self, maid: Maid, slot: TimeSlot) -> bool:
-        return maid.works_during(slot) and not self._is_booked(maid.id, slot)
+        return maid.works_during(slot) and not self._bookings.find_busy_slots([maid.id], slot).get(maid.id)
 
-    def _is_booked(self, maid_id: str, slot: TimeSlot) -> bool:
-        return any(s.overlaps(slot) for s in self._busy_slots(maid_id))
-
-    def _busy_slots(self, maid_id: str) -> list[TimeSlot]:
-        return [o.slot for b in self._bookings.find_by_maid_id(maid_id) for o in b.occurrences if o.is_active]
+    def free_maids(self, maids: list[Maid], slot: TimeSlot) -> list[Maid]:
+        """The maids free for `slot`, using one bookings query for all of them."""
+        working = [m for m in maids if m.works_during(slot)]
+        busy = self._bookings.find_busy_slots([m.id for m in working], slot)
+        return [m for m in working if not busy.get(m.id)]
 
     def start_time_counts(self, maids: list[Maid], day: date, duration_minutes: int, not_before: datetime,
                           step_minutes: int = 15, earliest: time = time(6, 0), latest: time = time(22, 0)
                           ) -> list[tuple[time, int]]:
         """For each candidate start time on `day`, how many of `maids` are free for `duration_minutes`.
-        Starts that are not after `not_before` count as 0. Each maid's bookings are read once."""
-        busy = {m.id: self._busy_slots(m.id) for m in maids}
+        Starts that are not after `not_before` count as 0. One bookings query covers the whole day."""
+        midnight = datetime.combine(day, time(0, 0))
+        busy = self._bookings.find_busy_slots([m.id for m in maids], TimeSlot(midnight, midnight + timedelta(days=1)))
         counts, start, last = [], datetime.combine(day, earliest), datetime.combine(day, latest)
         while start <= last:
             slot = TimeSlot.of(start, duration_minutes)
             free = 0 if start <= not_before else sum(
-                1 for m in maids if m.works_during(slot) and not any(b.overlaps(slot) for b in busy[m.id]))
+                1 for m in maids if m.works_during(slot) and not any(b.overlaps(slot) for b in busy.get(m.id, [])))
             counts.append((start.time(), free))
             start += timedelta(minutes=step_minutes)
         return counts

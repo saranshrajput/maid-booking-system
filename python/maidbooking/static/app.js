@@ -40,7 +40,7 @@ function icon(markup) { const t = document.createElement("template"); t.innerHTM
 
 const state = {
   customer: "", area: "", serverMs: Date.now(), fetchedAt: Date.now(),
-  maids: new Map(), allMaids: [], flow: null, timers: [],
+  maids: new Map(), localities: [], flow: null, timers: [],
 };
 
 /* ===================== helpers ===================== */
@@ -97,7 +97,7 @@ const newKey = () => (window.crypto && crypto.randomUUID ? crypto.randomUUID() :
 class ApiError extends Error {
   constructor(message, code, status) { super(message); this.code = code; this.status = status; }
 }
-async function api(path, { method = "GET", body, headers = {} } = {}) {
+async function api(path, { method = "GET", body, headers = {}, withTotal = false } = {}) {
   const res = await fetch(path, {
     method,
     headers: { ...(body ? { "Content-Type": "application/json" } : {}), ...headers },
@@ -106,7 +106,7 @@ async function api(path, { method = "GET", body, headers = {} } = {}) {
   let data = null;
   try { data = await res.json(); } catch (e) { /* empty body */ }
   if (!res.ok) throw new ApiError((data && data.message) || `Request failed (${res.status})`, data && data.code, res.status);
-  return data;
+  return withTotal ? { items: data, total: Number(res.headers.get("X-Total-Count") ?? data.length) } : data;
 }
 
 function toast(message, kind) {
@@ -122,10 +122,9 @@ async function getMaid(id) {
   return state.maids.get(id);
 }
 function remember(maids) { maids.forEach((m) => state.maids.set(m.id, m)); }
-function localities() { return [...new Set(state.allMaids.map((m) => m.locality))].sort(); }
-async function refreshAllMaids() {
-  state.allMaids = await api("/api/maids/search");
-  remember(state.allMaids);
+const localities = () => state.localities;
+async function refreshLocalities() {
+  state.localities = await api("/api/localities");
 }
 
 function field(labelText, input, hint) {
@@ -250,14 +249,12 @@ async function renderHome(view) {
       el("h1", null, "A trusted maid, whenever you need one"),
       el("p", null, "Book instantly, for a day, for a week or on repeat.")),
     el("div", { class: "sheet-top" }, el("div", { class: "section" }, el("h2", null, "What service do you need?")), tiles));
-  const [all, here] = await Promise.all([api("/api/maids/search"), state.area ? api(`/api/maids/search?locality=${encodeURIComponent(state.area)}`) : null]);
-  state.allMaids = all; remember(all);
-  const pool = here || all;
-  tiles.replaceChildren(...SERVICES.map((s) => tile(s, pool.filter((m) => m.hourlyRates[s] !== undefined))));
+  const [summary] = await Promise.all([api(servicesSummaryUrl()), refreshLocalities()]);
+  tiles.replaceChildren(...SERVICES.map((s) => tile(s, summary[s] || { maids: 0 })));
   view.append(el("a", { class: "promo", href: "#/details/CLEANING/now", id: "promo" },
     el("div", null, el("b", null, "Need help right now?"), el("span", null, "Book a maid who is free this minute")),
     el("span", { class: "go" }, "Book now")));
-  if (!all.length) {
+  if (!state.localities.length) {
     view.append(el("div", { class: "card" }, el("h3", null, "No maids yet"), el("p", { class: "sub" }, "Load three sample maids to try the whole booking flow."),
       el("div", { class: "actions" }, el("button", { class: "btn primary", type: "button", id: "seed-btn", onclick: seedMaids }, "Load sample maids"))));
   } else if (!state.area) {
@@ -266,11 +263,14 @@ async function renderHome(view) {
   }
 }
 
-function tile(service, maids) {
-  const loaded = maids !== null;
-  const available = !loaded || maids.length > 0;
-  const sub = !loaded ? "" : maids.length
-    ? `from ${money(Math.min(...maids.map((m) => m.hourlyRates[service])))}/hour · ${maids.length} ${maids.length === 1 ? "maid" : "maids"}` : "Not available in this area";
+const servicesSummaryUrl = () => `/api/services/summary${state.area ? `?locality=${encodeURIComponent(state.area)}` : ""}`;
+
+// entry is { maids, minHourlyRate } from the summary endpoint, or null while it loads.
+function tile(service, entry) {
+  const loaded = entry !== null;
+  const available = !loaded || entry.maids > 0;
+  const sub = !loaded ? "" : entry.maids
+    ? `from ${money(entry.minHourlyRate)}/hour · ${entry.maids} ${entry.maids === 1 ? "maid" : "maids"}` : "Not available in this area";
   return el(available ? "a" : "div", { class: "tile", href: available ? `#/details/${service}` : null, "aria-disabled": available ? null : "true", "data-service": service },
     el("div", { class: "ico" }, icon(SVG[service])), el("b", null, SERVICE_TITLES[service]), el("small", null, sub));
 }
@@ -285,7 +285,7 @@ async function seedMaids() {
         availability: s.days.map((day) => ({ day, start: s.start, end: s.end })) } });
     }
     toast("Added 3 sample maids");
-    await refreshAllMaids();
+    await refreshLocalities();
     route();
   } catch (err) {
     toast(err.message, "err");
@@ -331,10 +331,9 @@ async function renderDetails(view, service, hint, opts = {}) {
           route({ keep: true });
         } }, text))),
     el("div", { id: "sections" }), el("div", { class: "bottombar", id: "bar" }));
-  const pool = await api(`/api/maids/search?serviceType=${service}${state.area ? `&locality=${encodeURIComponent(state.area)}` : ""}`);
-  remember(pool);
-  f.maidCount = pool.length;
-  f.minRate = pool.length ? Math.min(...pool.map((m) => m.hourlyRates[service])) : null;
+  const entry = (await api(servicesSummaryUrl()))[service];
+  f.maidCount = entry ? entry.maids : 0;
+  f.minRate = entry ? entry.minHourlyRate : null;
   drawSections();
   if (f.start && f.mode !== "NOW") loadSlots();
 }
@@ -481,24 +480,24 @@ function flowSummary(f) {
   return `${SERVICE_TITLES[f.service]} · ${when}${span} · ${f.duration} mins`;
 }
 
+const MAIDS_PAGE_SIZE = 20;
+
 async function renderMaids(view) {
   const f = state.flow;
   if (!flowReady(f)) { go("#/home"); return; }
   const visits = visitCount(f);
-  const list = el("div", { id: "maid-list" }, el("p", { class: "sub", style: "padding:0 16px" }, "Finding maids…"));
+  const cards = el("div", { id: "maid-list" }, el("p", { class: "sub", style: "padding:0 16px" }, "Finding maids…"));
+  const count = el("p", { class: "sub", id: "result-count" });
+  const more = el("button", { class: "btn block", type: "button", id: "show-more", hidden: true, style: "width:calc(100% - 32px);margin:4px 16px 16px" }, "Show more maids");
   view.append(topbar("Choose your maid", { back: () => go(`#/details/${f.service}/keep`) }),
-    el("div", { class: "section" }, el("p", { class: "sub", id: "flow-summary" }, flowSummary(f))), list);
+    el("div", { class: "section" }, el("p", { class: "sub", id: "flow-summary" }, flowSummary(f)), count), cards, more);
+
   const { date, startTime } = flowSlotParams(f);
-  const q = new URLSearchParams({ serviceType: f.service, date, startTime, durationMinutes: String(f.duration) });
+  const q = new URLSearchParams({ serviceType: f.service, date, startTime, durationMinutes: String(f.duration), limit: String(MAIDS_PAGE_SIZE) });
   if (state.area) q.set("locality", state.area);
-  const maids = await api(`/api/maids/search?${q}`);
-  remember(maids);
-  if (!maids.length) {
-    list.replaceChildren(el("div", { class: "empty", id: "no-match" }, el("h3", null, "No maid is free then"), el("p", null, "Try another time, date or duration."),
-      el("a", { class: "btn primary", href: `#/details/${f.service}/keep` }, "Change details")));
-    return;
-  }
-  list.replaceChildren(...maids.map((m) => {
+  let shown = 0;
+
+  const card = (m) => {
     const perVisit = m.hourlyRates[f.service] * f.duration / 60;
     return el("article", { class: "card maid", "data-maid": m.name },
       el("div", { class: "maid-top" }, el("div", { class: "avatar", "aria-hidden": "true" }, m.name.charAt(0).toUpperCase()),
@@ -507,7 +506,26 @@ async function renderMaids(view) {
       el("div", { class: "maid-foot" },
         el("div", null, el("b", null, money(perVisit * visits)), el("div", { class: "sub" }, visits > 1 ? `${money(perVisit)} × ${visits} visits` : `${money(m.hourlyRates[f.service])}/hour`)),
         el("button", { class: "btn primary", type: "button", "data-book": m.name, onclick: (e) => reserve(m, e.currentTarget) }, "Book")));
-  }));
+  };
+  const loadPage = async () => {
+    more.disabled = true;
+    q.set("offset", String(shown));
+    const page = await api(`/api/maids/search?${q}`, { withTotal: true });
+    remember(page.items);
+    if (!shown) cards.replaceChildren();
+    if (!page.total) {
+      cards.replaceChildren(el("div", { class: "empty", id: "no-match" }, el("h3", null, "No maid is free then"), el("p", null, "Try another time, date or duration."),
+        el("a", { class: "btn primary", href: `#/details/${f.service}/keep` }, "Change details")));
+      return;
+    }
+    cards.append(...page.items.map(card));
+    shown += page.items.length;
+    count.textContent = `${page.total} ${page.total === 1 ? "maid" : "maids"} available`;
+    more.hidden = shown >= page.total;
+    more.disabled = false;
+  };
+  more.addEventListener("click", () => loadPage().catch((err) => { toast(err.message, "err"); more.disabled = false; }));
+  await loadPage();
 }
 
 async function reserve(maid, button) {
@@ -791,7 +809,7 @@ function renderPartner(view) {
         gender: document.getElementById("m-gender").value, rating: Number(document.getElementById("m-rating").value), hourlyRates,
         skills: document.getElementById("m-skills").value.split(",").map((x) => x.trim()).filter(Boolean), availability } });
       remember([maid]);
-      await refreshAllMaids();
+      await refreshLocalities();
       toast(`${maid.name} added`);
       go("#/home");
     } catch (err) { fail(err.message); }
@@ -803,6 +821,7 @@ function renderPartner(view) {
 (async function boot() {
   try { state.customer = localStorage.getItem("mb.customer") || "customer-1"; state.area = localStorage.getItem("mb.area") || ""; } catch (e) { state.customer = "customer-1"; }
   try { await syncClock(); } catch (e) { /* fall back to the browser clock */ }
+  try { await refreshLocalities(); } catch (e) { /* the home screen loads them again */ }
   window.addEventListener("hashchange", () => route());
   setInterval(() => { syncClock().catch(() => {}); }, 5 * 60 * 1000);
   route();

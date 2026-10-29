@@ -243,6 +243,32 @@ async function payWith(method, instrument) {
   await page.waitForSelector('.tile[data-service="COOKING"] small:has-text("1 maid")');
   check((await text('.tile[data-service="COOKING"] small')).includes('from ₹320/hour'), 'a new maid appears under her area with her rate');
 
+  // 12b. Many maids: the list is paged and aggregates come from the server
+  await page.evaluate(async () => {
+    for (let i = 0; i < 24; i++) {
+      await fetch('/api/maids', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        name: `Bulk ${String(i).padStart(2, '0')}`, locality: 'Koramangala', gender: 'FEMALE', rating: 3 + (i % 10) / 10, hourlyRates: { CLEANING: 150 + i },
+        skills: [], availability: [0, 1, 2, 3, 4, 5].map((day) => ({ day, start: '08:00', end: '18:00' })) }) });
+    }
+  });
+  await page.goto(`${BASE}/#/home`);
+  await page.click('#area-btn');
+  await page.click('button[data-area="Koramangala"]');
+  await page.waitForSelector('.tile[data-service="CLEANING"] small:has-text("maids")');
+  check((await text('.tile[data-service="CLEANING"] small')).includes('from ₹150/hour · 26 maids'), 'home tiles aggregate 26 cleaning maids in one summary query');
+  await startDetails('CLEANING', 'ONE');
+  await pickDate(tuesday);
+  await page.waitForSelector('.slot[data-time="08:00"]');
+  await chooseSlot('14:00', 'Afternoon');
+  await page.click('#see-maids');
+  await page.waitForSelector('article.maid');
+  check((await page.locator('article.maid').count()) === 20, 'the maid list shows one page of 20');
+  check((await text('#result-count')) === '26 maids available', 'the total comes from the server');
+  await page.click('#show-more');
+  await page.waitForFunction(() => document.querySelectorAll('article.maid').length === 26);
+  check(await page.locator('#show-more').isHidden(), 'Show more loads the rest and hides itself');
+  await page.screenshot({ path: `${SHOTS}/11-paged-list.png` });
+
   // 13. Layout and errors
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
   check(!overflow, 'no horizontal scrolling at phone width');

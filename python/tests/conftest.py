@@ -16,7 +16,7 @@ from maidbooking.payment_processors import (CardPaymentProcessor, PaymentProcess
                                             UpiPaymentProcessor, WalletPaymentProcessor)
 from maidbooking.pricing import HourlyPricingStrategy  # noqa: E402
 from maidbooking.config import build_infrastructure  # noqa: E402
-from maidbooking.search import MaidSearchService, standard_providers  # noqa: E402
+from maidbooking.search import MaidSearchService  # noqa: E402
 from maidbooking.services import (AvailabilityService, BookingService, CancellationService,  # noqa: E402
                                   MaidService, OnboardMaidCommand, PaymentService)
 
@@ -29,7 +29,7 @@ def reset_database(url: str):
     from maidbooking.sql_persistence import create_db_engine
     engine = create_db_engine(url)
     with engine.begin() as conn:
-        conn.execute(text("TRUNCATE idempotency_keys, payments, booking_occurrences, bookings, maids"))
+        conn.execute(text("TRUNCATE idempotency_keys, payments, booking_occurrences, bookings, maid_services, maids"))
     engine.dispose()
 
 
@@ -42,6 +42,7 @@ class Ctx:
         if database_url and reset:
             reset_database(database_url)
         self.maid_repo, self.booking_repo, self.payment_repo = infra.maids, infra.bookings, infra.payments
+        self.engine = infra.engine  # None for the in-memory backend
         self.maids = MaidService(self.maid_repo)
         self.availability = AvailabilityService(self.booking_repo)
         locks = infra.locks
@@ -55,7 +56,7 @@ class Ctx:
                                        processors, locks)
         self.cancellations = CancellationService(self.booking_repo, self.payment_repo, processors,
                                                  TimeBasedCancellationPolicy(), locks, clock)
-        self.search = MaidSearchService(self.maid_repo, standard_providers(self.availability))
+        self.search = MaidSearchService(self.maid_repo, self.availability)
 
     # Works 08:00-20:00 every day, CLEANING only.
     def maid(self, name="Asha", locality="Koramangala", gender=Gender.FEMALE, rating=4.5, rate="200", *skills):

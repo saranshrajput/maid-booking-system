@@ -109,3 +109,24 @@ def test_meta_and_slot_availability():
         "/api/availability/slots", params={**params, "date": "2030-01-07"}).json()}
     assert today["10:00"] == 0 and today["10:15"] == 1  # a start that is not after now is not offered
     assert client.get("/api/availability/slots", params={"durationMinutes": 60}).status_code == 400
+
+
+def test_pagination_localities_and_service_summary():
+    client = TestClient(create_app())
+    for i in range(5):
+        client.post("/api/maids", json={**MAID, "name": f"Maid {i}", "rating": 4.0 + i / 10,
+                                         "locality": "Koramangala" if i < 4 else "Indiranagar"})
+
+    first = client.get("/api/maids/search", params={"limit": 2})
+    assert [m["name"] for m in first.json()] == ["Maid 4", "Maid 3"]
+    assert first.headers["X-Total-Count"] == "5"
+    second = client.get("/api/maids/search", params={"limit": 2, "offset": 2})
+    assert [m["name"] for m in second.json()] == ["Maid 2", "Maid 1"]
+    assert client.get("/api/maids/search", params={"locality": "koramangala"}).headers["X-Total-Count"] == "4"
+    assert client.get("/api/maids/search", params={"limit": 0}).status_code == 400
+    assert client.get("/api/maids/search", params={"limit": 101}).status_code == 400
+
+    assert client.get("/api/localities").json() == ["Indiranagar", "Koramangala"]
+    assert client.get("/api/services/summary").json() == {"CLEANING": {"maids": 5, "minHourlyRate": 200.0}}
+    assert client.get("/api/services/summary", params={"locality": "indiranagar"}).json()["CLEANING"]["maids"] == 1
+    assert client.get("/api/services/summary", params={"locality": "nowhere"}).json() == {}
