@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maid Booking</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <a class="brand" href="#find" aria-label="Maid Booking home"><span class="mark" aria-hidden="true"></span>Maid Booking</a>
+      <nav class="tabs" aria-label="Main">
+        <a href="#find" data-tab="find">Find a maid</a>
+        <a href="#bookings" data-tab="bookings">My bookings</a>
+        <a href="#add" data-tab="add">Add a maid</a>
+      </nav>
+      <label class="who">
+        <span>Booking as</span>
+        <input id="customer" type="text" autocomplete="off" spellcheck="false" maxlength="60" aria-label="Customer id">
+      </label>
+    </div>
+  </header>
+
+  <main id="view" tabindex="-1"></main>
+
+  <dialog id="dlg" aria-labelledby="dlg-title">
+    <div class="dlg-head">
+      <h2 id="dlg-title"></h2>
+      <button type="button" class="icon" id="dlg-close" aria-label="Close">&times;</button>
+    </div>
+    <div id="dlg-body"></div>
+  </dialog>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

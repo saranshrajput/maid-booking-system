@@ -115,6 +115,11 @@ class BookingService:
             raise NotFoundError(f"Booking not found: {booking_id}")
         return booking
 
+    # Newest visit first, so upcoming bookings lead the list.
+    def list_for_customer(self, customer_id: str) -> list[Booking]:
+        bookings = self._bookings.find_by_customer_id(customer_id)
+        return sorted(bookings, key=lambda b: min(o.slot.start for o in b.occurrences), reverse=True)
+
     @staticmethod
     def _validate(c: BookingCommand):
         if not c.customer_id or not c.customer_id.strip():

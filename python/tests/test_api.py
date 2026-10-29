@@ -56,3 +56,27 @@ def test_postgres_backed_app_survives_restart():
 
     restarted = TestClient(create_app(database_url=url))  # Fresh app, same database.
     assert restarted.get(f"/api/maids/{maid_id}").status_code == 200
+
+
+def test_list_bookings_by_customer_and_ui_is_served():
+    client = TestClient(create_app())
+    maid_id = client.post("/api/maids", json=MAID).json()["id"]
+    start = (datetime.now() + timedelta(days=3)).replace(hour=10, minute=0, second=0, microsecond=0)
+
+    def book(customer, hour):
+        body = {"customerId": customer, "maidId": maid_id, "serviceType": "CLEANING", "bookingType": "SCHEDULED",
+                "durationMinutes": 60, "startDateTime": start.replace(hour=hour).isoformat()}
+        return client.post("/api/bookings", json=body).json()["id"]
+
+    a1, a2, b1 = book("alice", 10), book("alice", 12), book("bob", 14)
+    listed = client.get("/api/bookings", params={"customerId": "alice"}).json()
+    assert {b["id"] for b in listed} == {a1, a2}
+    assert [b["id"] for b in listed] == [a2, a1]  # latest first
+    assert [b["id"] for b in client.get("/api/bookings", params={"customerId": "bob"}).json()] == [b1]
+    assert client.get("/api/bookings", params={"customerId": "nobody"}).json() == []
+    assert client.get("/api/bookings").status_code == 400
+
+    page = client.get("/")
+    assert page.status_code == 200 and "Maid Booking" in page.text
+    assert client.get("/app.js").status_code == 200
+    assert client.get("/health").json()["status"] == "ok"  # API routes still win over the static mount

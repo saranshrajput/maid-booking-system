@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Callable, Optional
@@ -6,6 +7,7 @@ from typing import Callable, Optional
 from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .booking_strategies import (BookingCommand, BookingStrategyRegistry, InstantBookingStrategy,
@@ -24,6 +26,7 @@ from .services import (AvailabilityService, BookingService, CancellationService,
                        OnboardMaidCommand, PayCommand, PaymentService)
 
 DEFAULT_SEARCH_DURATION_MINUTES = 60
+STATIC_DIR = Path(__file__).parent / "static"
 ERROR_STATUS = {NotFoundError: (404, "NOT_FOUND"), InvalidRequestError: (400, "INVALID_REQUEST"),
                 SlotUnavailableError: (409, "SLOT_UNAVAILABLE"), InvalidStateError: (409, "INVALID_STATE"),
                 PaymentFailedError: (402, "PAYMENT_FAILED")}
@@ -152,6 +155,10 @@ def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Opt
         return booking_json(booking_service.book(BookingCommand(
             r.customerId, r.maidId, r.serviceType, r.bookingType, r.durationMinutes, r.startDateTime, rule)))
 
+    @app.get("/api/bookings")
+    def list_bookings(customerId: str = Query(min_length=1)):
+        return [booking_json(b) for b in booking_service.list_for_customer(customerId)]
+
     @app.get("/api/bookings/{booking_id}")
     def get_booking(booking_id: str):
         return booking_json(booking_service.get(booking_id))
@@ -169,6 +176,8 @@ def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Opt
         return {"booking": booking_json(result.booking), "cancelledOccurrenceIds": result.cancelled_occurrence_ids,
                 "totalRefund": float(result.total_refund)}
 
+    # Static UI last, so every API route above wins over it.
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
     return app
 
 
