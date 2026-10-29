@@ -1,5 +1,5 @@
 // End-to-end UI test. Needs a running server (BASE) and the `playwright` package.
-// Usage: BASE=http://127.0.0.1:8000 SHOTS=/tmp/shots node e2e/ui.e2e.js
+// Usage: BASE=http://127.0.0.1:8000 SHOTS=/tmp/shots node e2e/ui.e2e.js   (server must start with no maids)
 const { chromium } = require('playwright');
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8000';
@@ -11,234 +11,254 @@ function nextWeekday(weekday /* 0 = Monday */, minDaysAhead) {
   while ((d.getDay() + 6) % 7 !== weekday) d.setDate(d.getDate() + 1);
   return iso(d);
 }
+const tuesday = nextWeekday(1, 3);
+const monday = nextWeekday(0, 3);
 
+const problems = [];
+let page;
 let step = 0;
 function check(cond, msg) {
   if (!cond) throw new Error(`FAIL: ${msg}`);
   console.log(`ok ${String(++step).padStart(2, '0')}  ${msg}`);
 }
-const names = (page) => page.locator('article.maid h3').allTextContents();
-async function waitForCards(page, n) {
-  await page.waitForFunction((count) => document.querySelectorAll('article.maid').length === count, n, { timeout: 8000 });
+const text = (sel) => page.locator(sel).first().innerText();
+async function pickDate(date) {
+  for (let i = 0; i < 4 && !(await page.locator(`#cal [data-date="${date}"]`).count()); i++) await page.click('#cal-next');
+  await page.click(`#cal [data-date="${date}"]`);
 }
-async function search(page, fields) {
-  for (const [id, value] of Object.entries(fields)) await page.fill(`#${id}`, value);
-  await page.click('#search-form button[type=submit]');
+async function startDetails(service, mode) {
+  await page.goto(`${BASE}/#/details/${service}`);
+  await page.waitForSelector('#sections .card');
+  await page.click(`.segtabs [data-mode="${mode}"]`);
+  await page.waitForSelector('#sections .card');
+}
+async function chooseSlot(time, period) {
+  if (period) await page.click(`[data-period="${period}"]`);
+  await page.click(`.slot[data-time="${time}"]`);
+}
+async function bookWith(name) {
+  await page.click('#see-maids');
+  await page.waitForSelector(`article.maid[data-maid="${name}"]`);
+  await page.click(`article.maid[data-maid="${name}"] [data-book]`);
+  await page.waitForSelector('#payment-form');
+}
+async function payWith(method, instrument) {
+  await page.selectOption('#p-method', method);
+  await page.fill('#p-instrument', instrument);
+  await page.click('#p-submit');
 }
 
-const problems = [];
-let page;
 (async () => {
   const browser = await chromium.launch();
-  page = await browser.newPage({ viewport: { width: 1200, height: 900 } });
+  page = await browser.newPage({ viewport: { width: 420, height: 900 } });
   page.on('pageerror', (e) => problems.push(`pageerror: ${e.message}`));
   page.on('console', (m) => { if (m.type() === 'error' && !m.text().includes('Failed to load resource')) problems.push(`console: ${m.text()}`); });
 
-  const tuesday = nextWeekday(1, 3);
-  const monday = nextWeekday(0, 3);
-
-  // 1. Empty state and sample data
+  // 1. Home, empty state, sample data, area
   await page.goto(BASE);
-  await page.waitForSelector('text=No maids match yet');
-  check(true, 'empty state is shown before any maid exists');
-  await page.screenshot({ path: `${SHOTS}/01-empty.png` });
+  await page.waitForSelector('#seed-btn');
+  check((await text('h2')).includes('What service do you need?'), 'home shows the service question and an empty state');
+  await page.screenshot({ path: `${SHOTS}/01-home-empty.png` });
   await page.click('#seed-btn');
-  await waitForCards(page, 3);
-  check((await names(page)).join() === 'Asha Rao,Meena Iyer,Ravi Kumar', 'sample maids load, sorted by rating');
-  await page.screenshot({ path: `${SHOTS}/02-results.png`, fullPage: true });
+  await page.waitForSelector('.tile[data-service="CLEANING"] small:has-text("2 maids")');
+  check((await text('.tile[data-service="CLEANING"] small')).includes('from ₹180/hour'), 'tiles show the lowest hourly rate and maid count');
+  await page.click('#area-btn');
+  await page.click('button[data-area="Koramangala"]');
+  await page.waitForSelector('.tile[data-service="LAUNDRY"][aria-disabled="true"]');
+  check((await text('#area-btn')).includes('Koramangala'), 'choosing an area updates the header');
+  check((await text('.tile[data-service="LAUNDRY"] small')).includes('Not available'), 'a service nobody offers in the area is disabled');
+  await page.screenshot({ path: `${SHOTS}/02-home.png`, fullPage: true });
 
-  // 2. Filters
-  await search(page, { 'f-locality': 'koramangala' });
-  await waitForCards(page, 2);
-  check((await names(page)).join() === 'Asha Rao,Ravi Kumar', 'area filter is case-insensitive');
-  await page.selectOption('#f-rating', '4.5');
-  await page.click('#search-form button[type=submit]');
-  await waitForCards(page, 1);
-  check((await names(page))[0] === 'Asha Rao', 'min rating filter');
-  await page.click('#f-reset');
-  await waitForCards(page, 3);
-  await page.selectOption('#f-gender', 'MALE');
-  await page.click('#search-form button[type=submit]');
-  await waitForCards(page, 1);
-  check((await names(page))[0] === 'Ravi Kumar', 'gender filter');
-  await page.click('#f-reset');
-  await search(page, { 'f-skills': 'infant-care' });
-  await waitForCards(page, 1);
-  check((await names(page))[0] === 'Meena Iyer', 'skills filter');
-  await page.click('#f-reset');
-  await search(page, { 'f-rate': '150' });
-  await waitForCards(page, 1);
-  check((await names(page))[0] === 'Ravi Kumar', 'max rate without a service matches any offered rate (Ravi dishwashing is 120)');
-  await page.selectOption('#f-service', 'CLEANING');
-  await page.click('#search-form button[type=submit]');
-  await page.waitForSelector('text=No maids match yet');
-  check(true, 'max rate with a service applies to that service only (cleaning rates are 180 and up)');
-  await page.click('#f-reset');
-  await waitForCards(page, 3);
+  // 2. Choose service details: calendar, duration, time slots
+  await page.click('.tile[data-service="CLEANING"]');
+  await page.waitForSelector('#cal');
+  check((await text('h2')).includes('Choose service details'), 'service tile opens the details screen');
+  await pickDate(tuesday);
+  await page.waitForSelector('.slot[data-time="08:00"]');
+  check(await page.locator('.slot[data-time="07:45"]').isDisabled(), 'a start time before every maid starts work is greyed out');
+  check(await page.locator('.slot[data-time="08:00"]').isEnabled(), 'a start time when a maid is free is selectable');
+  check(await page.locator('#see-maids').isDisabled(), 'maid list stays locked until a time is chosen');
+  await chooseSlot('10:00');
+  check((await text('#bar-price')) === 'from ₹180', 'price bar shows the cheapest total for the choice');
+  await page.click('[data-minutes="120"]');
+  await page.waitForSelector('.slot[data-time="10:00"]');
+  check((await text('#bar-price')) === 'from ₹360', 'changing the duration updates the price and clears the time');
+  check(await page.locator('#see-maids').isDisabled(), 'changing the duration clears the chosen time');
+  await page.click('[data-minutes="60"]');
+  await page.waitForSelector('.slot[data-time="10:00"]');
+  await chooseSlot('10:00');
+  await page.screenshot({ path: `${SHOTS}/03-details.png`, fullPage: true });
 
-  // 3. Availability search
-  await search(page, { 'f-date': tuesday, 'f-time': '10:00' });
-  await waitForCards(page, 3);
-  check(true, 'all three maids are free Tuesday 10:00');
-  await search(page, { 'f-time': '08:30' });
-  await waitForCards(page, 1);
-  check((await names(page))[0] === 'Asha Rao', 'only maids working at 08:30 are returned');
-  await page.fill('#f-time', '');
-  await page.click('#search-form button[type=submit]');
-  await page.waitForSelector('text=Pick both a date and a start time');
-  check(true, 'date without time is rejected with a message');
-
-  // 4. Book, decline, pay
-  await search(page, { 'f-date': tuesday, 'f-time': '10:00' });
-  await waitForCards(page, 3);
-  await page.click('article.maid:has-text("Asha Rao") >> text=Book Asha');
-  await page.waitForSelector('#booking-form');
-  check((await page.inputValue('#b-date')) === tuesday, 'booking dialog is prefilled from the search');
-  await page.screenshot({ path: `${SHOTS}/03-book-dialog.png` });
-  await page.click('#b-submit');
+  // 3. Maid list, declined and successful payment
+  await page.click('#see-maids');
+  await page.waitForSelector('article.maid');
+  const names = await page.locator('article.maid h3').allTextContents();
+  check(names.join() === 'Asha Rao,Ravi Kumar', 'only maids free at that time are listed, best rated first');
+  await page.screenshot({ path: `${SHOTS}/04-maids.png`, fullPage: true });
+  await page.click('article.maid[data-maid="Asha Rao"] [data-book]');
   await page.waitForSelector('#payment-form');
-  check(await page.locator('#p-submit').textContent() === 'Pay ₹250.00', 'payment button shows the amount');
-  await page.fill('#p-instrument', 'fail@upi');
-  await page.click('#p-submit');
-  await page.waitForSelector('#p-error .banner.err');
-  check((await page.textContent('#p-error')).includes('declined'), 'declined payment shows an error and stays on the form');
-  await page.screenshot({ path: `${SHOTS}/04-payment-declined.png` });
+  check((await text('#p-submit')) === 'Pay ₹250.00', 'payment sheet shows the amount to pay');
+  await payWith('UPI', 'fail@upi');
+  await page.waitForSelector('#p-error .note.err');
+  check((await text('#p-error')).includes('declined'), 'a declined payment shows an error and keeps the sheet open');
+  await page.screenshot({ path: `${SHOTS}/05-payment.png` });
   await page.fill('#p-instrument', 'asha@upi');
   await page.click('#p-submit');
-  await page.waitForSelector('text=Booking confirmed');
-  check((await page.textContent('#dlg-body')).includes('₹250.00'), 'payment succeeds and booking is confirmed');
-  await page.screenshot({ path: `${SHOTS}/05-confirmed.png` });
-  await page.click('#dlg-body button:text-is("Close")');
+  await page.waitForSelector('#paid-title');
+  check((await text('#paid-title')) === 'Booking confirmed', 'successful payment confirms the booking');
+  await page.click('#view-booking');
 
-  // 5. The booked maid disappears from availability search
-  await page.waitForSelector('article.maid');
-  await search(page, { 'f-date': tuesday, 'f-time': '10:00' });
-  await waitForCards(page, 2);
-  check(!(await names(page)).includes('Asha Rao'), 'a booked maid is no longer offered for that time');
-
-  // 6. Another customer cannot take the same slot
-  await page.fill('#customer', 'bob');
-  await page.press('#customer', 'Tab');
-  await page.fill('#f-date', '');
-  await page.fill('#f-time', '');
-  await page.click('#search-form button[type=submit]');
-  await waitForCards(page, 3);
-  await page.click('article.maid:has-text("Asha Rao") >> text=Book Asha');
-  await page.fill('#b-date', tuesday);
-  await page.fill('#b-time', '10:30');
-  await page.click('#b-submit');
-  await page.waitForSelector('#b-error .banner.err');
-  check((await page.textContent('#b-error')).includes('not available'), 'double booking attempt shows the conflict');
-  await page.click('#dlg-body button:text-is("Cancel")');
-
-  // 7. Bookings are per customer
-  await page.goto(`${BASE}/#bookings`);
-  await page.waitForSelector('text=No bookings yet');
-  check(true, 'a different customer sees no bookings');
-  await page.fill('#customer', 'customer-1');
-  await page.press('#customer', 'Tab');
-  await page.waitForSelector('article.booking');
-  check((await page.textContent('article.booking')).includes('Confirmed'), 'original customer sees the confirmed booking');
-  await page.screenshot({ path: `${SHOTS}/06-my-bookings.png`, fullPage: true });
-
-  // 8. Cancel with refund
-  await page.click('article.booking button:has-text("Cancel")');
-  await page.click('article.booking button:has-text("Confirm cancel")');
+  // 4. Booking details, then cancel with refund
+  await page.waitForSelector('#status-title');
+  check((await text('#status-title')) === 'Upcoming service', 'booking details show an upcoming service');
+  check(!/null|undefined/.test(await text('#view')), 'booking details show no stray null or undefined text');
+  check((await text('#d-start')) === '10:00 am' && (await text('#d-total')) === '₹250.00' && (await text('#d-paystatus')) === 'Paid online', 'details show time, amount and paid status');
+  await page.screenshot({ path: `${SHOTS}/06-booking-details.png`, fullPage: true });
+  await page.click('#detail-actions button.visit');
+  await page.click('#detail-actions button.visit:has-text("Confirm cancel")');
   await page.waitForSelector('.toast:has-text("Refund ₹250.00")');
-  check(true, 'cancelling more than 24h ahead refunds in full');
-  await page.waitForSelector('article.booking .pill:has-text("Cancelled")');
-  await page.goto(`${BASE}/#find`);
-  await search(page, { 'f-date': tuesday, 'f-time': '10:00' });
-  await waitForCards(page, 3);
-  check((await names(page)).includes('Asha Rao'), 'cancelled slot is bookable again');
+  await page.waitForSelector('#status-title:has-text("Booking cancelled")');
+  check(true, 'cancelling more than 24h ahead refunds in full and marks the booking cancelled');
 
-  // 9. Recurring booking, partial payment, then cancellations
-  await page.fill('#f-date', ''); await page.fill('#f-time', '');
-  await search(page, { 'f-locality': 'koramangala' });
-  await waitForCards(page, 2);
-  await page.click('article.maid:has-text("Ravi Kumar") >> text=Book Ravi');
-  await page.click('label:has-text("Recurring")');
-  await page.click('.days label:has-text("Mon")');
-  await page.click('.days label:has-text("Wed")');
-  await page.fill('#b-rdate', monday);
-  await page.fill('#b-rtime', '10:00');
-  await page.fill('#b-count', '4');
-  check((await page.textContent('#estimate')).includes('₹720.00'), 'recurring estimate multiplies by the number of visits');
-  await page.click('#b-submit');
-  await page.waitForSelector('#payment-form');
+  // 5. Grey-out: when every maid is booked, that start time becomes unavailable
+  async function bookAt10(maidName) {
+    await startDetails('CLEANING', 'ONE');
+    await pickDate(tuesday);
+    await page.waitForSelector('.slot[data-time="10:00"]');
+    await chooseSlot('10:00');
+    await bookWith(maidName);
+    await page.click('#pay-later');
+  }
+  await bookAt10('Asha Rao');
+  await bookAt10('Ravi Kumar');
+  await startDetails('CLEANING', 'ONE');
+  await pickDate(tuesday);
+  await page.waitForSelector('.slot[data-time="10:00"]');
+  check(await page.locator('.slot[data-time="10:00"]').isDisabled(), 'a start time with every maid booked is greyed out');
+  check(await page.locator('.slot[data-time="09:15"]').isDisabled(), 'a start time that overlaps the bookings is greyed out too');
+  check(await page.locator('.slot[data-time="11:00"]').isEnabled(), 'the time right after the bookings is still free');
+  await page.screenshot({ path: `${SHOTS}/07-slots-greyed.png`, fullPage: true });
+
+  // 6. Pay a held booking later from My bookings
+  await page.goto(`${BASE}/#/bookings`);
+  await page.waitForSelector('article.bk');
+  check((await page.locator('article.bk').count()) === 3, 'bookings list shows every booking for the customer');
+  check((await text('#filters [aria-pressed="true"]')) === 'All', 'All filter is selected by default');
+  const held = page.locator('article.bk:has-text("Awaiting payment")').first();
+  await held.locator('a.bk-main').click();
+  await page.waitForSelector('#pay-visit');
+  check((await text('#status-title')) === 'Payment pending', 'a held booking shows payment pending');
+  await page.click('#pay-visit');
+  await payWith('CARD', '4111111111111111');
+  await page.waitForSelector('#paid-title');
+  await page.click('#paid-close');
+  await page.waitForSelector('#status-title:has-text("Upcoming service")');
+  check(true, 'a held booking can be paid later and becomes upcoming');
+
+  // 7. Multiple days
+  await startDetails('CLEANING', 'MULTI');
+  const wed = nextWeekday(2, 10), fri = nextWeekday(4, 10);
+  await pickDate(wed);
+  await pickDate(fri);
+  check((await text('.rangebar .daychip')) === '3 days', 'picking a start and end date shows the number of days');
+  await page.waitForSelector('.slot[data-time="09:00"]');
+  await chooseSlot('09:00');
+  check((await text('#bar-price')) === 'from ₹540', 'multi-day price multiplies by the number of days');
+  await bookWith('Ravi Kumar');
+  check((await text('#p-submit')) === 'Pay ₹540.00', 'paying all three days costs the sum');
+  await payWith('WALLET', 'wallet-1');
+  await page.waitForSelector('#paid-title');
+  await page.click('#paid-close');
+
+  // 8. Weekly recurring, pay one visit
+  await startDetails('COOKING', 'WEEKLY');
+  await pickDate(monday);
+  await page.click('#weekly-card [data-day="2"]');
+  await page.fill('#visits', '4');
+  await page.waitForSelector('.slot[data-time="10:00"]');
+  await chooseSlot('10:00');
+  await bookWith('Asha Rao');
   await page.click('label:has-text("One visit")');
-  await page.selectOption('#p-method', 'WALLET');
-  await page.fill('#p-instrument', 'wallet-1');
-  await page.click('#p-submit');
-  await page.waitForSelector('text=Visit paid');
-  check((await page.textContent('#dlg-body')).includes('3 visits still awaiting payment'), 'one visit of a series can be paid on its own');
-  await page.click('#dlg-body button:text-is("Close")');
-  await page.goto(`${BASE}/#bookings`);
-  const series = page.locator('article.booking:has-text("Recurring")');
-  await series.waitFor();
-  check((await series.textContent()).includes('Awaiting payment'), 'series shows awaiting payment while visits are unpaid');
-  await series.locator('button:has-text("Pay all 3 unpaid")').click();
-  await page.selectOption('#p-method', 'CARD');
-  await page.fill('#p-instrument', '4111111111111111');
-  check((await page.locator('#p-submit').textContent()) === 'Pay ₹540.00', 'pay-all button sums the unpaid visits');
-  await page.click('#p-submit');
-  await page.waitForSelector('text=Booking confirmed');
-  await page.click('#dlg-body button:text-is("Close")');
-  await page.waitForFunction(() => {
-    const card = [...document.querySelectorAll('article.booking')].find((a) => a.textContent.includes('Recurring'));
-    return card && card.querySelectorAll('.occ li .pill.CONFIRMED').length === 4;
-  });
-  check(await series.locator('.occ li').count() === 4, 'series lists all four visits');
-  await page.screenshot({ path: `${SHOTS}/07-series.png`, fullPage: true });
-  await series.locator('.occ li').nth(1).locator('button:has-text("Cancel")').click();
-  await series.locator('.occ li').nth(1).locator('button:has-text("Confirm cancel")').click();
+  await payWith('UPI', 'asha@upi');
+  await page.waitForSelector('#paid-title');
+  check((await text('#paid-detail')).includes('3 visits still awaiting payment'), 'one visit of a weekly series can be paid on its own');
+  await page.click('#paid-close');
+
+  // 9. Bookings list filters and visits
+  await page.goto(`${BASE}/#/bookings`);
+  await page.waitForSelector('article.bk[data-kind="multiple"]');
+  check((await page.locator('article.bk[data-kind="multiple"]').count()) === 1 && (await page.locator('article.bk[data-kind="recurring"]').count()) === 1, 'bookings are classified as single, multiple or recurring');
+  await page.click('#filters [data-filter="multiple"]');
+  check((await page.locator('article.bk').count()) === 1, 'the Multiple filter shows only multi-day bookings');
+  const multi = page.locator('article.bk[data-kind="multiple"]');
+  check((await multi.textContent()).includes('3 days'), 'multi-day card summarises the number of days');
+  await multi.locator('.togglevisits').click();
+  check((await multi.locator('a.visit').count()) === 3, 'expanding a card lists every visit');
+  await page.screenshot({ path: `${SHOTS}/08-bookings.png`, fullPage: true });
+  await multi.locator('a.visit').nth(1).click();
+  await page.waitForSelector('.dots');
+  check((await page.locator('.dot').count()) === 3, 'visit details show a dot per visit');
+  await page.screenshot({ path: `${SHOTS}/09-visit-details.png`, fullPage: true });
+  await page.click('#detail-actions button.visit');
+  await page.click('#detail-actions button.visit:has-text("Confirm cancel")');
   await page.waitForSelector('.toast:has-text("Cancelled 1 visit. Refund ₹180.00")');
-  check(true, 'a single visit of the series can be cancelled with its own refund');
-  await series.locator('button:has-text("Cancel whole series")').click();
-  await series.locator('button:has-text("Confirm cancel series")').click();
-  await page.waitForSelector('.toast:has-text("Cancelled 3 visits. Refund ₹540.00")');
-  await series.locator('> .booking-head .pill:has-text("Cancelled")').waitFor();
+  await page.waitForSelector('.dot.cancelled');
+  check(true, 'cancelling one visit of a series refunds just that visit');
+  await page.click('#detail-actions button.series');
+  await page.click('#detail-actions button.series:has-text("Confirm cancel series")');
+  await page.waitForSelector('.toast:has-text("Cancelled 2 visits. Refund ₹360.00")');
   check(true, 'cancelling the whole series refunds the remaining visits');
 
-  // 10. Add a maid (validation, then success)
-  await page.goto(`${BASE}/#add`);
+  // 10. Instant booking answers either way
+  await startDetails('CLEANING', 'NOW');
+  await page.click('#see-maids');
+  await page.waitForSelector('article.maid, #no-match');
+  check(true, 'instant booking lists maids free right now or explains there are none');
+
+  // 11. Account and customers
+  await page.click('#dlg-close').catch(() => {});
+  await page.goto(`${BASE}/#/account`);
+  await page.fill('#customer', 'bob');
+  await page.press('#customer', 'Enter');
+  await page.goto(`${BASE}/#/bookings`);
+  await page.waitForSelector('#no-bookings');
+  check(true, 'a different customer id sees no bookings');
+  await page.goto(`${BASE}/#/account`);
+  await page.fill('#customer', 'customer-1');
+  await page.press('#customer', 'Enter');
+
+  // 12. Add a maid
+  await page.click('#add-maid-link');
   await page.fill('#m-name', 'Zoya Khan');
   await page.fill('#m-locality', 'HSR Layout');
-  await page.fill('#m-rating', '4.9');
   await page.check('input[name=svc][value=COOKING]');
-  await page.click('#add-form button[type=submit]');
-  await page.waitForSelector('#add-form .banner.err');
-  check((await page.textContent('#add-form .banner.err')).includes('hourly rate for Cooking'), 'add form asks for a rate for every chosen service');
+  await page.click('#add-submit');
+  await page.waitForSelector('#add-form .note.err');
+  check((await text('#add-form .note.err')).includes('hourly rate for cooking'), 'add form asks for a rate for every chosen service');
   await page.fill('input[name=rate-COOKING]', '320');
-  await page.fill('#m-skills', 'baking, north-indian');
-  await page.click('#add-form button[type=submit]');
+  await page.click('#add-submit');
   await page.waitForSelector('.toast:has-text("Zoya Khan added")');
-  await waitForCards(page, 4);
-  await page.selectOption('#f-service', 'COOKING');
-  await search(page, { 'f-locality': 'hsr layout' });
-  await waitForCards(page, 1);
-  check((await page.textContent('article.maid')).includes('₹320.00/h'), 'new maid is searchable with her rate');
-  check((await page.locator('#localities option').evaluateAll((o) => o.map((x) => x.value))).includes('HSR Layout'), 'area suggestions include the new maid\'s area');
+  await page.click('#area-btn');
+  await page.click('button[data-area="HSR Layout"]');
+  await page.waitForSelector('.tile[data-service="COOKING"] small:has-text("1 maid")');
+  check((await text('.tile[data-service="COOKING"] small')).includes('from ₹320/hour'), 'a new maid appears under her area with her rate');
 
-  // 11. Instant booking gives either a payment form or a clear reason
-  await page.click('#f-reset');
-  await waitForCards(page, 4);
-  await page.click('article.maid:has-text("Meena Iyer") >> text=Book Meena');
-  await page.click('label:has-text("Instant")');
-  await page.click('#b-submit');
-  await page.waitForSelector('#payment-form, #b-error .banner.err');
-  check(true, 'instant booking responds with a payment form or an explained error');
-  await page.keyboard.press('Escape');
-
-  // 12. Phone layout
-  const phone = await browser.newPage({ viewport: { width: 390, height: 844 } });
-  await phone.goto(BASE);
-  await phone.waitForSelector('article.maid');
-  const overflow = await phone.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
+  // 13. Layout and errors
+  const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);
   check(!overflow, 'no horizontal scrolling at phone width');
-  await phone.screenshot({ path: `${SHOTS}/08-phone.png` });
-
+  const wide = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  await wide.goto(`${BASE}/#/bookings`);
+  await wide.waitForSelector('article.bk');
+  await wide.screenshot({ path: `${SHOTS}/10-desktop.png` });
   check(problems.length === 0, `no JavaScript errors (${problems.join(' | ') || 'none'})`);
   await browser.close();
   console.log(`\nAll ${step} UI checks passed`);
-})().catch(async (e) => { console.error(e.message); if (page) { await page.screenshot({ path: `${SHOTS}/failure.png`, fullPage: true }).catch(() => {}); console.error('Page text:', (await page.textContent('main').catch(() => '')).slice(0, 400)); } if (problems.length) console.error('Browser problems:', problems.join(' | ')); process.exit(1); });
+})().catch(async (e) => {
+  console.error(e.message);
+  if (problems.length) console.error('Browser problems:', problems.join(' | '));
+  if (page) {
+    await page.screenshot({ path: `${SHOTS}/failure.png`, fullPage: true }).catch(() => {});
+    console.error('Page text:', (await page.innerText('body').catch(() => '')).replace(/\s+/g, ' ').slice(0, 500));
+  }
+  process.exit(1);
+});
