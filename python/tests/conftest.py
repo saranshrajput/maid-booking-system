@@ -43,7 +43,7 @@ class Ctx:
             reset_database(database_url)
         self.maid_repo, self.booking_repo, self.payment_repo = infra.maids, infra.bookings, infra.payments
         self.engine = infra.engine  # None for the in-memory backend
-        self.maids = MaidService(self.maid_repo)
+        self.maids = MaidService(self.maid_repo, self.booking_repo, clock)
         self.availability = AvailabilityService(self.booking_repo)
         locks = infra.locks
         processors = PaymentProcessorRegistry([CardPaymentProcessor(), UpiPaymentProcessor(),

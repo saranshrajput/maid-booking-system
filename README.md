@@ -19,11 +19,12 @@ The same FastAPI app serves a mobile-first web UI at `/` (files in `python/maidb
 - **Choose your maid**: maids free for that exact slot, best rated first, with the total price. Booking holds the slot and opens the payment sheet (card, UPI or wallet; one visit or all unpaid visits).
 - **Your bookings**: All, Single, Multiple and Recurring filters, status pills (upcoming, in progress, completed, awaiting payment, cancelled), and expandable visit lists.
 - **Booking details**: status banner with time left while a visit is running, maid, date, payment status, a dot per visit, Pay and Cancel (one visit or the whole series, refund shown).
-- **Account**: customer id (there is no login), service area, and partner onboarding (add a maid, or load three sample maids).
+- **Account**: customer id (there is no login), service area, and partner tools: add a maid, load the three sample maids (it skips ones already there), and **Manage maids**.
+- **Manage maids**: remove a maid, or all sample maids. Removing hides her from search and booking while old bookings keep her name. If she has upcoming visits the removal is refused, with an option to cancel those visits (full refunds, since the maid is leaving) and remove her.
 
 "Upcoming", "in progress" and "completed" are derived in the browser from the server clock (`GET /api/meta`); the API itself only stores pending, confirmed and cancelled.
 
-Browser test (needs Node and the `playwright` package): `PYTHON=python ./python/e2e/run.sh` starts a fresh in-memory server and runs 47 checks across every screen, including slot greying, a payment decline, series payment and cancellation, and phone width. Set `DATABASE_URL` to run the same flow against Postgres (the database must be empty).
+Browser test (needs Node and the `playwright` package): `PYTHON=python ./python/e2e/run.sh` starts a fresh in-memory server and runs 55 checks across every screen, including slot greying, a payment decline, series payment and cancellation, removing maids and phone width, then 18 more on "Book now" against a server with a fixed clock (`e2e/fixed_clock_server.py`): a daytime run where an instant booking goes through to an in-progress visit, and a night run where nobody is free. Set `DATABASE_URL` to run the same flow against Postgres (the database must be empty).
 
 ## Scaling notes
 
@@ -63,7 +64,7 @@ The old no-slot search also returned every match (about 500) instead of a page, 
 |---|---|
 | `DATABASE_URL` | Postgres connection string. Unset = in-memory. `postgres://` and `postgresql://` are both accepted. Tables are created on startup. |
 | `APP_TIMEZONE` | Business timezone for "now" and availability windows (default `Asia/Kolkata`; servers on Render run UTC). |
-| `TEST_DATABASE_URL` | Enables the Postgres runs of the test suite (the service tests run on both backends: 79 tests). |
+| `TEST_DATABASE_URL` | Enables the Postgres runs of the test suite (the service tests run on both backends: 84 tests). |
 
 Run the same suite against Postgres: `TEST_DATABASE_URL=postgresql://user:pass@localhost/db python -m pytest`.
 
@@ -89,6 +90,7 @@ Notes: run a single worker (the start command already does); the schema is creat
 | Book | `POST /api/bookings` |
 | Get booking | `GET /api/bookings/{id}` |
 | List a customer's bookings | `GET /api/bookings?customerId=` |
+| Remove a maid | `DELETE /api/maids/{id}[?cancelUpcoming=true]` (409 `MAID_HAS_UPCOMING_BOOKINGS` if she has upcoming visits and the flag is not set) |
 | Free-maid count per start time | `GET /api/availability/slots?date=&durationMinutes=&serviceType=&locality=` |
 | Areas and per-service summary | `GET /api/localities`, `GET /api/services/summary?locality=` |
 | Server clock | `GET /api/meta` |

@@ -20,3 +20,7 @@ class InvalidStateError(MaidBookingError):
 
 class PaymentFailedError(MaidBookingError):
     pass
+
+
+class MaidHasUpcomingBookingsError(InvalidStateError):
+    pass

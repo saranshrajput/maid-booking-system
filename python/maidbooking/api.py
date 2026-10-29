@@ -15,8 +15,8 @@ from .booking_strategies import (BookingCommand, BookingStrategyRegistry, Instan
 from .cancellation_policy import TimeBasedCancellationPolicy
 from .domain import (AvailabilityWindow, Booking, BookingType, DayOfWeek, Gender, Maid, PaymentMethodType,
                      RecurrenceRule, ServiceType, TimeSlot)
-from .exceptions import (InvalidRequestError, InvalidStateError, NotFoundError, PaymentFailedError,
-                         SlotUnavailableError)
+from .exceptions import (InvalidRequestError, InvalidStateError, MaidHasUpcomingBookingsError, NotFoundError,
+                         PaymentFailedError, SlotUnavailableError)
 from .payment_processors import (CardPaymentProcessor, PaymentProcessorRegistry, UpiPaymentProcessor,
                                  WalletPaymentProcessor)
 from .config import build_infrastructure, local_clock
@@ -29,7 +29,7 @@ DEFAULT_SEARCH_DURATION_MINUTES = 60
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
 STATIC_DIR = Path(__file__).parent / "static"
-ERROR_STATUS = {NotFoundError: (404, "NOT_FOUND"), InvalidRequestError: (400, "INVALID_REQUEST"),
+ERROR_STATUS = {MaidHasUpcomingBookingsError: (409, "MAID_HAS_UPCOMING_BOOKINGS"), NotFoundError: (404, "NOT_FOUND"), InvalidRequestError: (400, "INVALID_REQUEST"),
                 SlotUnavailableError: (409, "SLOT_UNAVAILABLE"), InvalidStateError: (409, "INVALID_STATE"),
                 PaymentFailedError: (402, "PAYMENT_FAILED")}
 
@@ -93,7 +93,7 @@ def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Opt
     maid_repo, booking_repo, payment_repo, locks = infra.maids, infra.bookings, infra.payments, infra.locks
     processors = PaymentProcessorRegistry([CardPaymentProcessor(), UpiPaymentProcessor(), WalletPaymentProcessor()])
     availability = AvailabilityService(booking_repo)
-    maid_service = MaidService(maid_repo)
+    maid_service = MaidService(maid_repo, booking_repo, clock)
     search_service = MaidSearchService(maid_repo, availability)
     booking_service = BookingService(
         maid_service, booking_repo,
@@ -111,7 +111,7 @@ def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Opt
     @app.exception_handler(InvalidStateError)
     @app.exception_handler(PaymentFailedError)
     async def domain_error(_: Request, e: Exception):
-        status, code = ERROR_STATUS[type(e)]
+        status, code = next(v for cls, v in ERROR_STATUS.items() if isinstance(e, cls))  # subclasses listed first
         return JSONResponse(status_code=status, content={"code": code, "message": str(e)})
 
     @app.exception_handler(RequestValidationError)
@@ -175,6 +175,20 @@ def create_app(clock: Optional[Callable[[], datetime]] = None, database_url: Opt
     @app.get("/api/maids/{maid_id}")
     def get_maid(maid_id: str):
         return maid_json(maid_service.get(maid_id))
+
+    @app.delete("/api/maids/{maid_id}")
+    def remove_maid(maid_id: str, cancelUpcoming: bool = False):
+        """Hide a maid from search and booking. Refused while she has upcoming visits unless cancelUpcoming=true,
+        which cancels them with full refunds."""
+        maid = maid_service.get(maid_id)
+        upcoming = maid_service.count_upcoming_visits(maid_id)
+        if upcoming and not cancelUpcoming:
+            raise MaidHasUpcomingBookingsError(
+                f"{maid.name} has {upcoming} upcoming {'visit' if upcoming == 1 else 'visits'}. "
+                "Cancel them first, or remove her with cancelUpcoming=true to cancel them with full refunds.")
+        maid_service.deactivate(maid_id)  # first, so nobody can book her while the visits are cancelled
+        cancelled, refund = cancellation_service.cancel_upcoming_for_maid(maid_id) if upcoming else (0, Decimal("0"))
+        return {"id": maid_id, "removed": True, "cancelledVisits": cancelled, "totalRefund": float(refund)}
 
     @app.post("/api/bookings", status_code=201)
     def book(r: CreateBookingRequest):

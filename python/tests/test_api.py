@@ -130,3 +130,28 @@ def test_pagination_localities_and_service_summary():
     assert client.get("/api/services/summary").json() == {"CLEANING": {"maids": 5, "minHourlyRate": 200.0}}
     assert client.get("/api/services/summary", params={"locality": "indiranagar"}).json()["CLEANING"]["maids"] == 1
     assert client.get("/api/services/summary", params={"locality": "nowhere"}).json() == {}
+
+
+def test_removing_a_maid_over_the_api():
+    now = datetime(2030, 1, 7, 10, 0)
+    client = TestClient(create_app(clock=lambda: now))
+    keep = client.post("/api/maids", json={**MAID, "name": "Keep"}).json()["id"]
+    gone = client.post("/api/maids", json={**MAID, "name": "Gone"}).json()["id"]
+    body = {"customerId": "c", "maidId": gone, "serviceType": "CLEANING", "bookingType": "SCHEDULED",
+            "durationMinutes": 60, "startDateTime": "2030-01-10T10:00"}
+    booking = client.post("/api/bookings", json=body).json()
+
+    refused = client.delete(f"/api/maids/{gone}")
+    assert refused.status_code == 409 and refused.json()["code"] == "MAID_HAS_UPCOMING_BOOKINGS"
+    assert "1 upcoming visit" in refused.json()["message"]
+    assert {m["name"] for m in client.get("/api/maids/search").json()} == {"Keep", "Gone"}
+
+    removed = client.delete(f"/api/maids/{gone}", params={"cancelUpcoming": "true"}).json()
+    assert removed["removed"] is True and removed["cancelledVisits"] == 1
+    assert [m["name"] for m in client.get("/api/maids/search").json()] == ["Keep"]
+    assert client.get("/api/services/summary").json()["CLEANING"]["maids"] == 1
+    assert client.get(f"/api/bookings/{booking['id']}").json()["status"] == "CANCELLED"
+    assert client.get(f"/api/maids/{gone}").json()["name"] == "Gone"        # old bookings can still show her
+    assert client.post("/api/bookings", json=body).status_code == 400       # but nobody can book her
+    assert client.delete(f"/api/maids/{keep}").json()["removed"] is True    # no upcoming visits: removed at once
+    assert client.delete("/api/maids/nope").status_code == 404

@@ -106,10 +106,15 @@ async function payWith(method, instrument) {
   await page.click('#p-submit');
   await page.waitForSelector('#paid-title');
   check((await text('#paid-title')) === 'Booking confirmed', 'successful payment confirms the booking');
+  // A slow network used to draw the details screen twice (the link and the closing sheet both re-rendered it).
+  await page.route('**/api/**', async (route) => { await new Promise((r) => setTimeout(r, 300)); await route.continue(); });
   await page.click('#view-booking');
 
   // 4. Booking details, then cancel with refund
   await page.waitForSelector('#status-title');
+  await page.waitForTimeout(1500);
+  check((await page.locator('.statusbar').count()) === 1 && (await page.locator('.topbar').count()) === 1, 'booking details are drawn once even on a slow network');
+  await page.unroute('**/api/**');
   check((await text('#status-title')) === 'Upcoming service', 'booking details show an upcoming service');
   check(!/null|undefined/.test(await text('#view')), 'booking details show no stray null or undefined text');
   check((await text('#d-start')) === '10:00 am' && (await text('#d-total')) === '₹250.00' && (await text('#d-paystatus')) === 'Paid online', 'details show time, amount and paid status');
@@ -268,6 +273,37 @@ async function payWith(method, instrument) {
   await page.waitForFunction(() => document.querySelectorAll('article.maid').length === 26);
   check(await page.locator('#show-more').isHidden(), 'Show more loads the rest and hides itself');
   await page.screenshot({ path: `${SHOTS}/11-paged-list.png` });
+
+  // 12c. Manage maids: remove one, remove the samples (blocked, then forced), and no duplicate sample maids
+  await page.goto(`${BASE}/#/manage`);
+  await page.waitForSelector('article.maid[data-maid="Meena Iyer"]');
+  await page.click('button.sample-remove');
+  await page.click('button.sample-remove:has-text("Confirm remove sample maids")');
+  await page.waitForSelector('#samples-blocked');
+  check((await text('#samples-blocked')).includes('2 sample maids have upcoming visits'), 'sample maids with upcoming visits are kept and the user is told');
+  check((await page.locator('article.maid[data-maid="Meena Iyer"]').count()) === 0, 'the sample maid with no visits is removed');
+  await page.click('#manage-banner button:has-text("Cancel their visits")');
+  await page.click('#manage-banner button:has-text("Confirm cancel and remove")');
+  await page.waitForFunction(() => !document.querySelector('#samples-blocked'));
+  check((await page.locator('article.maid[data-maid="Asha Rao"], article.maid[data-maid="Ravi Kumar"]').count()) === 0, 'forcing removes the rest, cancelling their upcoming visits');
+  await page.click('article.maid[data-maid="Zoya Khan"] button.remove');
+  await page.click('article.maid[data-maid="Zoya Khan"] button:has-text("Confirm remove")');
+  await page.waitForFunction(() => !document.querySelector('article.maid[data-maid="Zoya Khan"]'));
+  check(true, 'a single maid with no visits is removed at once');
+  await page.goto(`${BASE}/#/home`);
+  await page.click('#area-btn');
+  await page.click('button[data-area="Koramangala"]');
+  await page.waitForSelector('.tile[data-service="CLEANING"] small:has-text("24 maids")');
+  check((await text('.tile[data-service="CLEANING"] small')).includes('from ₹150/hour · 24 maids'), 'removed maids no longer count on the home screen');
+  await page.goto(`${BASE}/#/bookings`);
+  await page.waitForSelector('article.bk');
+  check((await page.locator('article.bk:has-text("Asha Rao")').count()) > 0, 'old bookings still show the removed maid\'s name');
+  await page.goto(`${BASE}/#/account`);
+  await page.click('#seed-btn');
+  await page.waitForSelector('.toast:has-text("Added 3 sample maids")');
+  await page.click('#seed-btn');
+  await page.waitForSelector('.toast:has-text("already added")');
+  check(true, 'tapping the sample button again does not add duplicates');
 
   // 13. Layout and errors
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth + 1);

@@ -135,6 +135,7 @@ class Maid:
     hourly_rates: dict
     skills: frozenset
     availability: tuple
+    active: bool = True  # False once removed: hidden from search and booking, still readable on old bookings
 
     def __post_init__(self):
         if not self.name or not self.name.strip():

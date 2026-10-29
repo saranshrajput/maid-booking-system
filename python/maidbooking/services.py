@@ -2,7 +2,7 @@ import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Callable, Optional, TypeVar
@@ -82,8 +82,11 @@ class OnboardMaidCommand:
 
 
 class MaidService:
-    def __init__(self, maids: MaidRepository):
+    def __init__(self, maids: MaidRepository, bookings: Optional[BookingRepository] = None,
+                 clock: Optional[Callable[[], datetime]] = None):
         self._maids = maids
+        self._bookings = bookings
+        self._clock = clock
 
     def onboard(self, c: OnboardMaidCommand) -> Maid:
         return self._maids.save(Maid(str(uuid.uuid4()), c.name, c.locality, c.gender, c.rating,
@@ -94,6 +97,16 @@ class MaidService:
         if maid is None:
             raise NotFoundError(f"Maid not found: {id}")
         return maid
+
+    def count_upcoming_visits(self, maid_id: str) -> int:
+        """Active visits that have not finished yet."""
+        now = self._clock()
+        return sum(1 for b in self._bookings.find_by_maid_id(maid_id) for o in b.occurrences
+                   if o.is_active and o.slot.end > now)
+
+    def deactivate(self, maid_id: str) -> Maid:
+        """Hide the maid from search and booking. Old bookings keep her name."""
+        return self._maids.save(replace(self.get(maid_id), active=False))
 
 
 class BookingService:
@@ -111,6 +124,8 @@ class BookingService:
     def book(self, cmd: BookingCommand) -> Booking:
         self._validate(cmd)
         maid = self._maids.get(cmd.maid_id)
+        if not maid.active:
+            raise InvalidRequestError(f"{maid.name} is no longer available")
         if not maid.offers(cmd.service_type):
             raise InvalidRequestError(f"{maid.name} does not offer {cmd.service_type.value}")
         slots = self._strategies.get(cmd.booking_type).resolve_slots(cmd, self._clock())
@@ -275,11 +290,29 @@ class CancellationService:
     def _is_cancellable(occurrence: BookingOccurrence, now: datetime) -> bool:
         return occurrence.is_active and occurrence.slot.end > now
 
-    def _refund(self, occurrence: BookingOccurrence, now: datetime) -> Decimal:
+    # The maid is leaving, so the customer is not at fault: every unfinished visit is cancelled with a full refund.
+    def cancel_upcoming_for_maid(self, maid_id: str) -> tuple[int, Decimal]:
+        def run() -> tuple[int, Decimal]:
+            now, cancelled, total = self._clock(), 0, Decimal("0")
+            for booking in self._bookings.find_by_maid_id(maid_id):
+                touched = False
+                for occurrence in booking.occurrences:
+                    if self._is_cancellable(occurrence, now):
+                        total += self._refund(occurrence, now, full=True)
+                        occurrence.cancel()
+                        cancelled, touched = cancelled + 1, True
+                if touched:
+                    self._bookings.save(booking)
+            return cancelled, total
+
+        return self._locks.with_lock(maid_id, run)
+
+    def _refund(self, occurrence: BookingOccurrence, now: datetime, full: bool = False) -> Decimal:
         payment = self._payments.find_captured_by_occurrence_id(occurrence.id)
         if payment is None:
             return Decimal("0")
-        amount = (payment.amount * self._policy.refund_fraction(occurrence, now)).quantize(
+        fraction = Decimal("1") if full else self._policy.refund_fraction(occurrence, now)
+        amount = (payment.amount * fraction).quantize(
             Decimal("0.01"), ROUND_HALF_UP)
         if amount > 0:
             self._processors.get(payment.method).refund(payment.gateway_reference, amount)
